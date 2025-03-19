@@ -25,7 +25,7 @@ from transformers import (  # AddedToken is needed for the eval of the tokenizer
     AutoTokenizer,
 )
 
-from m4.training.types import DatasetNames
+from m4.training.enums import DatasetNames
 from m4.utils.check_valid_tokenizer import check_valid_tokenizer
 
 
@@ -112,7 +112,8 @@ class Erosion(alb.ImageOnlyTransform):
     """
 
     def __init__(self, scale, always_apply=False, p=0.5):
-        super().__init__(always_apply=always_apply, p=p)
+        p = 1.0 if always_apply else p
+        super().__init__(p=p)
         if type(scale) is tuple or type(scale) is list:
             assert len(scale) == 2
             self.scale = scale
@@ -146,7 +147,8 @@ class Dilation(alb.ImageOnlyTransform):
     """
 
     def __init__(self, scale, always_apply=False, p=0.5):
-        super().__init__(always_apply=always_apply, p=p)
+        p = 1.0 if always_apply else p
+        super().__init__(p=p)
         if type(scale) is tuple or type(scale) is list:
             assert len(scale) == 2
             self.scale = scale
@@ -178,7 +180,8 @@ class Bitmap(alb.ImageOnlyTransform):
     """
 
     def __init__(self, value=0, lower=200, always_apply=False, p=0.5):
-        super().__init__(always_apply=always_apply, p=p)
+        p = 1.0 if always_apply else p
+        super().__init__(p=p)
         self.lower = lower
         self.value = value
 
