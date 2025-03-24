@@ -1,16 +1,16 @@
 import json
 import logging
 import time
-from dataclasses import InitVar, asdict, dataclass
+from dataclasses import InitVar, asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import git
+# import git
 import yaml
 from simple_parsing import ArgumentParser, Serializable
 from simple_parsing.helpers import dict_field, list_field
 
-from m4.training.types import DatasetNames, DatasetTypes
+from m4.training.enums import DatasetNames, DatasetTypes, MaskingTypes
 from m4.training.utils import LoggingTypes
 
 
@@ -127,7 +127,7 @@ class Hparams:
     batch_size_per_gpu: int = 1
     global_batch_size: Optional[int] = None
 
-    global_batch_size_ramp_up: GlobalBatchSizeRampUp = GlobalBatchSizeRampUp()
+    global_batch_size_ramp_up: GlobalBatchSizeRampUp = field(default_factory=GlobalBatchSizeRampUp)
     grad_acc_size: Optional[int] = 1
 
     grad_clip: float = 1.0
@@ -217,7 +217,7 @@ class ResumeParams:
     resume_epoch: int = 0
     resume_dataset_state: List = list_field()
 
-    gbs_running: GlobalBatchSizeRampUpRunningParams = GlobalBatchSizeRampUpRunningParams()
+    gbs_running: GlobalBatchSizeRampUpRunningParams = field(default_factory=GlobalBatchSizeRampUpRunningParams)
 
 
 @dataclass
@@ -228,8 +228,8 @@ class DatasetParams:
     max_num_images: int = 5
     # maximum sequence length
     max_seq_len: int = 256
-    training_datasets_paths: List[Path] = list_field()
-    validation_datasets_paths: List[Path] = list_field()
+    training_datasets_paths: Path | List[Path] = list_field()
+    validation_datasets_paths: Path | List[Path] = list_field()
     # if True, instead of split and pack, each instance in sample will be
     # either truncated or padded to the same length.
     pad_dataset: bool = True
@@ -270,35 +270,79 @@ class DatasetParams:
     # Parameter has to be set later once the vision_config is known.
     vision_encoder_max_image_size: int = 0
 
+    def __post_init__(self):
+        if isinstance(self.training_datasets_paths, Path):
+            self.training_datasets_paths = [self.training_datasets_paths]
+        if isinstance(self.validation_datasets_paths, Path):
+            self.validation_datasets_paths = [self.validation_datasets_paths]
 
 @dataclass
 class ImageCaptionPairedDatasetParams(DatasetParams):
     dataset_type: DatasetTypes = DatasetTypes.IMAGE_CAPTION_PAIRS
 
+    image_column: str = "images"
+    text_column: str = "texts"
+
+    @property
+    def dataset_columns_mapping(self):
+        return {self.image_column: "images", self.text_column: "texts"}
 
 @dataclass
 class OCRDatasetParams(DatasetParams):
     dataset_type: DatasetTypes = DatasetTypes.OCR
 
+    image_column: str = "images"
+    text_column: str = "texts"
+
+    @property
+    def dataset_columns_mapping(self):
+        return {self.image_column: "images", self.text_column: "texts"}
 
 @dataclass
 class DOCVQADatasetParams(DatasetParams):
     dataset_type: DatasetTypes = DatasetTypes.DOCVQA
 
+    image_column: str = "image"
+    question_column: str = "question"
+    answer_column: str = "answer"
+
+    @property
+    def dataset_columns_mapping(self):
+        return {self.image_column: "image", self.question_column: "question", self.answer_column: "answer"}
 
 @dataclass
 class VQAv2TaskFineTuningPairedDatasetParams(DatasetParams):
     dataset_type: DatasetTypes = DatasetTypes.VQAV2_TASK_FINETUNING
 
+    image_column: str = "image"
+    question_column: str = "question"
+    answer_column: str = "answer"
+
+    @property
+    def dataset_columns_mapping(self):
+        return {self.image_column: "image", self.question_column: "question", self.answer_column: "answer"}
 
 @dataclass
 class WebDocumentsDatasetParams(DatasetParams):
     dataset_type: DatasetTypes = DatasetTypes.WEB_DOCUMENTS
 
+    image_column: str = "images"
+    text_column: str = "texts"
 
+    @property
+    def dataset_columns_mapping(self):
+        return {self.image_column: "images", self.text_column: "texts"}
+    
 @dataclass
 class SFTDatasetParams(DatasetParams):
     dataset_type: DatasetTypes = DatasetTypes.SFT
+
+    image_column: str = "images"
+    text_column: str = "texts"
+
+    @property
+    def dataset_columns_mapping(self):
+        return {self.image_column: "images", self.text_column: "texts"}
 
 
 @dataclass
@@ -325,25 +369,27 @@ class DataParams(Serializable):
     select_n_examples_train: Optional[int] = None
     select_n_examples_validation: Optional[int] = None
 
+    # Type of masking to use for the training data
+    mask_type: Optional[MaskingTypes] = None
+
     # TODO: Move to per dataset params as it makes more sense there
     proba_interleaving_dataset: Optional[List[float]] = None
+    
+    pmd: ImageCaptionPairedDatasetParams = field(default_factory=lambda: ImageCaptionPairedDatasetParams(dataset_name=DatasetNames.PMD))
+    laion: ImageCaptionPairedDatasetParams = field(default_factory=lambda: ImageCaptionPairedDatasetParams(dataset_name=DatasetNames.LAION))
+    laion_coco: ImageCaptionPairedDatasetParams = field(default_factory=lambda: ImageCaptionPairedDatasetParams(dataset_name=DatasetNames.LAION_COCO))
+    tikz: ImageCaptionPairedDatasetParams = field(default_factory=lambda: ImageCaptionPairedDatasetParams(dataset_name=DatasetNames.TIKZ))
+    image_website_code: ImageCaptionPairedDatasetParams = field(default_factory=lambda: ImageCaptionPairedDatasetParams(dataset_name=DatasetNames.IMAGE_WEBSITE_CODE))
 
-    pmd: ImageCaptionPairedDatasetParams = ImageCaptionPairedDatasetParams(dataset_name=DatasetNames.PMD)
-    laion: ImageCaptionPairedDatasetParams = ImageCaptionPairedDatasetParams(dataset_name=DatasetNames.LAION)
-    laion_coco: ImageCaptionPairedDatasetParams = ImageCaptionPairedDatasetParams(dataset_name=DatasetNames.LAION_COCO)
-    tikz: ImageCaptionPairedDatasetParams = ImageCaptionPairedDatasetParams(dataset_name=DatasetNames.TIKZ)
-    image_website_code: ImageCaptionPairedDatasetParams = ImageCaptionPairedDatasetParams(
-        dataset_name=DatasetNames.IMAGE_WEBSITE_CODE
-    )
-    ocr: OCRDatasetParams = OCRDatasetParams(dataset_name=DatasetNames.OCR)
-    docvqa: DOCVQADatasetParams = DOCVQADatasetParams(dataset_name=DatasetNames.DOCVQA)
-    cm4: WebDocumentsDatasetParams = WebDocumentsDatasetParams(dataset_name=DatasetNames.CM4)
-    wiki: WebDocumentsDatasetParams = WebDocumentsDatasetParams(dataset_name=DatasetNames.WIKI)
-    vqav2_task_finetuning: VQAv2TaskFineTuningPairedDatasetParams = VQAv2TaskFineTuningPairedDatasetParams(
-        dataset_name=DatasetNames.VQAV2_TASK_FINETUNING
-    )
-    sft: SFTDatasetParams = SFTDatasetParams(dataset_name=DatasetNames.SFT)
+    ocr: OCRDatasetParams = field(default_factory=lambda: OCRDatasetParams(dataset_name=DatasetNames.OCR))
+    docvqa: DOCVQADatasetParams = field(default_factory=lambda: DOCVQADatasetParams(dataset_name=DatasetNames.DOCVQA))
 
+    cm4: WebDocumentsDatasetParams = field(default_factory=lambda: WebDocumentsDatasetParams(dataset_name=DatasetNames.CM4))
+    wiki: WebDocumentsDatasetParams = field(default_factory=lambda: WebDocumentsDatasetParams(dataset_name=DatasetNames.WIKI))
+
+    vqav2_task_finetuning: VQAv2TaskFineTuningPairedDatasetParams = field(default_factory=lambda: VQAv2TaskFineTuningPairedDatasetParams(dataset_name=DatasetNames.VQAV2_TASK_FINETUNING))
+
+    sft: SFTDatasetParams = field(default_factory=lambda: SFTDatasetParams(dataset_name=DatasetNames.SFT))
 
 @dataclass
 class OptimizerParams:
@@ -374,10 +420,10 @@ class OptimizerParams:
 class Parameters(Serializable):
     """base options."""
 
-    hparams: Hparams = Hparams()
-    optim_param: OptimizerParams = OptimizerParams()
-    data_param: DataParams = DataParams()
-    resume_param: ResumeParams = ResumeParams()
+    hparams: Hparams = field(default_factory=Hparams)
+    optim_param: OptimizerParams = field(default_factory=OptimizerParams)
+    data_param: DataParams = field(default_factory=DataParams)
+    resume_param: ResumeParams = field(default_factory=ResumeParams)
     should_verify: InitVar[bool] = True
 
     def verify(self, should_verify: bool):
@@ -408,8 +454,8 @@ class Parameters(Serializable):
                 self.data_param.select_n_examples_validation = self.data_param.select_n_examples
 
         # Get commit id
-        if self.hparams.repo_commit_id is None:
-            self.hparams.repo_commit_id = git.Repo(search_parent_directories=True).head.object.hexsha
+        # if self.hparams.repo_commit_id is None:
+        #     self.hparams.repo_commit_id = git.Repo(search_parent_directories=True).head.object.hexsha
 
         if self.hparams.lora_name is not None and not self.hparams.use_lora:
             raise ValueError("Can't have a lora_name if use_lora is False")

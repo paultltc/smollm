@@ -8,7 +8,7 @@ import os
 from dataclasses import asdict
 from functools import partial
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 
 import datasets
 import numpy as np
@@ -27,7 +27,12 @@ from m4.training.packing import (
     split_pack_and_pad_sft,
     split_pack_and_pad_webdocs,
 )
-from m4.training.types import DatasetNames, DatasetTypes
+from m4.training.enums import DatasetNames, DatasetTypes, MaskingTypes
+from m4.training.collator import (
+    SimpleDataCollatorForVisionLanguage, 
+    DataCollatorForVisionLanguageModeling, 
+    DataCollatorForSFT
+)
 
 
 Image.MAX_IMAGE_PIXELS = None
@@ -94,6 +99,10 @@ def to_tensor(batch):
 def simple_collate(x):
     return x[0]
 
+collators_map = {
+    "mlm": DataCollatorForVisionLanguageModeling,
+    "sft": DataCollatorForSFT,
+}
 
 def get_mapper(
     tokenizer,
@@ -114,6 +123,8 @@ def get_mapper(
     add_begin_of_doc_token: bool = True,
     add_end_of_doc_token: bool = True,
     max_num_images_per_document: Optional[int] = None,
+    mask_type: MaskingTypes = None,
+    **collator_kwargs
 ):
     mapper_kwargs = {
         "tokenizer": tokenizer,
@@ -150,7 +161,15 @@ def get_mapper(
         mapper_kwargs["max_num_images_per_document"] = max_num_images_per_document
 
     mapper_with_args = partial(split_fn, **mapper_kwargs)
-    return mapper_with_args
+
+    collator_class = collators_map.get(mask_type, SimpleDataCollatorForVisionLanguage)
+    collator = collator_class(
+        processor=mapper_with_args,
+        tokenizer=tokenizer, 
+        **collator_kwargs
+    )
+
+    return collator
 
 
 def get_dataloaders(
@@ -215,15 +234,12 @@ def load_hf_dataset(dataset_path):
             else:
                 hf_dataset = datasets.load_dataset(dataset_path)
     else:
-        if config_name is not None:
-            hf_dataset = datasets.load_dataset(
-                dataset_path, name=config_name, use_auth_token=os.environ.get("HF_TOKEN", True)
-            )
-        else:
-            hf_dataset = datasets.load_dataset(dataset_path, use_auth_token=os.environ.get("HF_TOKEN", True))
+        hf_dataset = datasets.load_dataset(dataset_path, token=os.environ.get("HF_TOKEN"))
 
     if split_name is not None:
         hf_dataset = hf_dataset[split_name]
+    else:
+        hf_dataset = hf_dataset["train"]
 
     return hf_dataset
 
@@ -235,6 +251,7 @@ def get_dataset_hf(
     is_train: bool = True,
     realtime_processing: bool = True,
     is_t5: bool = False,
+    mask_type: MaskingTypes = None
 ):
     dataset_list = []
     hf_datasets_paths = (
@@ -247,6 +264,10 @@ def get_dataset_hf(
 
     for dataset_path in hf_datasets_paths:
         hf_dataset = load_hf_dataset(dataset_path=str(dataset_path))
+
+        # Map columns to the expected names, TODO: apply this logic to webdataset as well
+        if dataset_config.dataset_columns_mapping is not None:
+            hf_dataset = hf_dataset.rename_columns(dataset_config.dataset_columns_mapping)
 
         is_paired_dataset = "meta" in hf_dataset[0] and "source" in hf_dataset[0]
 
@@ -276,10 +297,11 @@ def get_dataset_hf(
                 pre_split_scale_up_frequency=dataset_config.pre_split_scale_up_frequency,
                 dataset_type=DatasetTypes.IMAGE_CAPTION_PAIRS if is_paired_dataset else DatasetTypes.WEB_DOCUMENTS,
                 is_t5=is_t5,
+                mask_type=mask_type,
                 **optional_kwargs,
             )
             hf_dataset = hf_dataset.map(
-                mapper_with_args,
+                lambda x: mapper_with_args(x),
                 batched=True,
                 batch_size=dataset_config.map_batch_size,
                 remove_columns=hf_dataset.column_names,
@@ -341,6 +363,7 @@ def get_dataset(
     realtime_processing: bool = True,
     is_t5: bool = False,
     use_webdataset: bool = False,
+    mask_type: MaskingTypes = None,
 ):
     if use_webdataset:
         return get_dataset_webdataset(
@@ -356,6 +379,7 @@ def get_dataset(
             is_train=is_train,
             realtime_processing=realtime_processing,
             is_t5=is_t5,
+            mask_type=mask_type,
         )
 
 
@@ -378,6 +402,7 @@ def get_dataloader(
     model_name=None,
     data_param: Optional[DataParams] = None,
     image_seq_len=None,
+    mask_type: MaskingTypes = None
 ):
     if is_train:
         select_n_examples = data_param.select_n_examples_train
@@ -402,6 +427,7 @@ def get_dataloader(
             realtime_processing=realtime_processing,
             is_t5=is_t5,
             use_webdataset=data_param.use_webdataset,
+            mask_type=mask_type,
         )
 
     if not realtime_processing:
@@ -477,6 +503,7 @@ def get_dataloader(
                 world_size=world_size,
                 drop_last=True,
                 is_t5=is_t5,
+                mask_type=mask_type,
                 image_seq_len=image_seq_len,
                 **dataset_kwargs,
             )
@@ -532,6 +559,7 @@ def get_dataloader_from_config(
         model_name=config.hparams.model_name,
         data_param=config.data_param,
         image_seq_len=image_seq_len,
+        mask_type=config.data_param.mask_type,
     )
     return dataloader
 
@@ -632,6 +660,7 @@ class IterableWrapperHFDataset(torch.utils.data.IterableDataset):
         world_size=None,
         drop_last=True,
         is_t5=False,
+        mask_type=None,
         # Dataset specific params
         max_num_images=5,
         max_seq_len=256,
@@ -670,6 +699,7 @@ class IterableWrapperHFDataset(torch.utils.data.IterableDataset):
             add_begin_of_doc_token=add_begin_of_doc_token,
             add_end_of_doc_token=add_end_of_doc_token,
             max_num_images_per_document=max_num_images_per_document,
+            mask_type=mask_type
         )
         self.batch_size = batch_size
         self.shuffle = shuffle
@@ -760,7 +790,7 @@ class IterableWrapperHFDataset(torch.utils.data.IterableDataset):
             # Feed `worker_indices[i]` to mapper to ensure "deterministic randomness" that we don't have to track...
             curr_mapped_batch = self.mapper(
                 self.dataset[worker_indices[i : i + self.mapper_batch_size]],
-                prefix_seed=(self.seed, self.epoch, self.rank, worker_id, i),
+                # prefix_seed=(self.seed, self.epoch, self.rank, worker_id, i),     # TODO: Never used, check if it is needed
             )
             torch.set_rng_state(rng_state)
             keys = list(curr_mapped_batch.keys())
@@ -867,6 +897,7 @@ class IterableWrapperWebdataset(torch.utils.data.IterableDataset):
     def __init__(
         self,
         dataset,
+        collator_fn,
         tokenizer,
         image_transform,
         batch_size,
@@ -879,6 +910,7 @@ class IterableWrapperWebdataset(torch.utils.data.IterableDataset):
         world_size=None,
         drop_last=True,
         is_t5=False,
+        mask_type=None,
         # Dataset specific params
         max_num_images=5,
         max_seq_len=256,
@@ -918,6 +950,7 @@ class IterableWrapperWebdataset(torch.utils.data.IterableDataset):
             add_begin_of_doc_token=add_begin_of_doc_token,
             add_end_of_doc_token=add_end_of_doc_token,
             max_num_images_per_document=max_num_images_per_document,
+            mask_type=mask_type
         )
         self.batch_size = batch_size
         self.shuffle = shuffle

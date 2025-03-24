@@ -9,6 +9,8 @@ from typing import List
 import numpy as np
 import torch
 
+import PIL
+
 from m4.training.utils import END_OF_UTTERANCE_TOKEN, FAKE_TOKEN_AROUND_IMAGE_V2, IMAGE_TOKEN, image_splitting
 
 
@@ -298,71 +300,73 @@ def greedy_packing(
         output_pixel_attention_masks.append(padded_pixel_attention_mask)
         output_num_images.append(len(images_))
 
-    if mask_labels:
-        # Logic specific for sft tuning: we only compute the loss on the assistant part
-        # That is a bit hacky workaround specifically for SFT.
-        # The proper way would have been to handle the label masking inside each `split_pack_and_pad_X`, pass as input and output of `greedy_packing` and pass it as input and output of `prepare_return`
-        # But that rather invasive change so doing that for now.
-        if end_of_utterance_token_id is None:
-            raise ValueError(
-                "That logic has only been implemented at this point for computing the loss on the assistant answers in"
-                " a user/assistant dialogue. We need `end_of_utterance_token_id`."
-            )
-        if bos_token_id is None or eos_token_id is None:
-            raise ValueError(
-                "Case where we don't separate packed sequence by `<BOS>` and `<EOS>` is not supported yet."
-            )
-        if assistant_token_ids is None:
-            raise ValueError(
-                "We were hoping to mask the part `\nAssistant:` too from the loss computation but"
-                " `assistant_token_ids` is not specified."
-            )
+    # if mask_labels:
+    #     # Logic specific for sft tuning: we only compute the loss on the assistant part
+    #     # That is a bit hacky workaround specifically for SFT.
+    #     # The proper way would have been to handle the label masking inside each `split_pack_and_pad_X`, pass as input and output of `greedy_packing` and pass it as input and output of `prepare_return`
+    #     # But that rather invasive change so doing that for now.
+    #     if end_of_utterance_token_id is None:
+    #         raise ValueError(
+    #             "That logic has only been implemented at this point for computing the loss on the assistant answers in"
+    #             " a user/assistant dialogue. We need `end_of_utterance_token_id`."
+    #         )
+    #     if bos_token_id is None or eos_token_id is None:
+    #         raise ValueError(
+    #             "Case where we don't separate packed sequence by `<BOS>` and `<EOS>` is not supported yet."
+    #         )
+    #     if assistant_token_ids is None:
+    #         raise ValueError(
+    #             "We were hoping to mask the part `\nAssistant:` too from the loss computation but"
+    #             " `assistant_token_ids` is not specified."
+    #         )
 
-        def find_delimiters_tokens_to_mask(label_list):
-            starts_ends_list = []
-            start, end = None, None
-            counter_eou = 0
+    #     def find_delimiters_tokens_to_mask(label_list):
+    #         starts_ends_list = []
+    #         start, end = None, None
+    #         counter_eou = 0
 
-            for idx, l_ in enumerate(label_list):
-                if l_ == bos_token_id:
-                    assert start is None and end is None, (idx, start, end)
-                    start = idx
-                elif l_ == end_of_utterance_token_id:
-                    counter_eou += 1
-                    if counter_eou % 2 != 0:
-                        assert start is not None and end is None, (idx, start, end)
-                        assert label_list[idx + 1 : idx + 1 + len(assistant_token_ids)] == assistant_token_ids
-                        end = idx + 1 + len(assistant_token_ids)
-                        starts_ends_list.append((start, end))
-                        start, end = None, None
-                    else:
-                        assert start is None and end is None, (idx, start, end)
-                        if idx + 1 < len(label_list) and label_list[idx + 1] != eos_token_id:
-                            start = idx + 1
-                elif l_ == eos_token_id:
-                    assert start is None and end is None, (idx, start, end)
-            assert start is None and end is None, (idx, start, end)
+    #         for idx, l_ in enumerate(label_list):
+    #             if l_ == bos_token_id:
+    #                 assert start is None and end is None, (idx, start, end)
+    #                 start = idx
+    #             elif l_ == end_of_utterance_token_id:
+    #                 counter_eou += 1
+    #                 if counter_eou % 2 != 0:
+    #                     assert start is not None and end is None, (idx, start, end)
+    #                     assert label_list[idx + 1 : idx + 1 + len(assistant_token_ids)] == assistant_token_ids
+    #                     end = idx + 1 + len(assistant_token_ids)
+    #                     starts_ends_list.append((start, end))
+    #                     start, end = None, None
+    #                 else:
+    #                     assert start is None and end is None, (idx, start, end)
+    #                     if idx + 1 < len(label_list) and label_list[idx + 1] != eos_token_id:
+    #                         start = idx + 1
+    #             elif l_ == eos_token_id:
+    #                 assert start is None and end is None, (idx, start, end)
+    #         assert start is None and end is None, (idx, start, end)
 
-            return starts_ends_list
+    #         return starts_ends_list
 
-        output_labels = []
-        for input_ids_ in output_input_ids:
-            labels_ = input_ids_.clone()
-            if (labels_ == end_of_utterance_token_id).sum() % 2 != 0:
-                logger.error(
-                    "Did not find an even number of `END_OF_UTTERANCE` tokens in the user/assistant dialogue. Not"
-                    " masking the labels."
-                )
-                output_labels.append(labels_)
-                continue
+    #     output_labels = []
+    #     for input_ids_ in output_input_ids:
+    #         labels_ = input_ids_.clone()
+    #         if (labels_ == end_of_utterance_token_id).sum() % 2 != 0:
+    #             logger.error(
+    #                 "Did not find an even number of `END_OF_UTTERANCE` tokens in the user/assistant dialogue. Not"
+    #                 " masking the labels."
+    #             )
+    #             output_labels.append(labels_)
+    #             continue
 
-            starts_ends = find_delimiters_tokens_to_mask(labels_.tolist())
-            for start_index, end_index in starts_ends:
-                labels_[start_index:end_index] = image_token_id
+    #         starts_ends = find_delimiters_tokens_to_mask(labels_.tolist())
+    #         for start_index, end_index in starts_ends:
+    #             labels_[start_index:end_index] = image_token_id
 
-            output_labels.append(labels_)
-    else:
-        output_labels = []
+    #         output_labels.append(labels_)
+    # else:
+    #     output_labels = []
+
+    output_labels = []
 
     return (
         output_input_ids,
@@ -443,9 +447,9 @@ def prepare_result_return(
     if padded_image_tensor is not None:
         result["pixel_values"] = padded_image_tensor[sort_by_padding]
 
-    if output_labels:
-        output_labels = torch.stack(output_labels)
-        result["labels"] = output_labels[sort_by_padding]
+    # if output_labels:
+    #     output_labels = torch.stack(output_labels)
+    #     result["labels"] = output_labels[sort_by_padding]
     return result
 
 
@@ -929,8 +933,8 @@ def split_pack_and_pad_pairs(
         MAX_NUM_IMAGE_ROWS_AND_COLUMNS**2 + 1 * (MAX_NUM_IMAGE_ROWS_AND_COLUMNS != 1)
     ) * max_num_images
 
-    text_batch = sample["text"]
-    image_batch = sample.get("image", None)
+    text_batch = sample["texts"]
+    image_batch = sample.get("images", None)
     if image_batch is None:
         raise ValueError("`images` must be present in the sample")
 
@@ -1057,8 +1061,9 @@ def split_pack_and_pad_ocr(
         MAX_NUM_IMAGE_ROWS_AND_COLUMNS**2 + 1 * (MAX_NUM_IMAGE_ROWS_AND_COLUMNS != 1)
     ) * max_num_images
 
-    text_batch = sample["texts"]
-    image_batch = sample.get("images", None)
+    text_batch = sample["texts"]     
+    image_batch = sample.get("images", None)  
+
     if image_batch is None:
         raise ValueError("`images` must be present in the sample")
 
@@ -1078,6 +1083,11 @@ def split_pack_and_pad_ocr(
     filtered_input_ids = []
     # Iterate through the lists of images and texts. Each list tuple contains a full pdf document with all the images and annotations associated
     for image_list, text_list in zip(image_batch, text_batch):
+        if isinstance(image_list, PIL.JpegImagePlugin.JpegImageFile):
+            image_list = [image_list]
+        if isinstance(text_list, str):
+            text_list = [text_list]
+
         len_text_list = len(text_list)
         curr_image_sublist = []
         curr_text_sublist = []
