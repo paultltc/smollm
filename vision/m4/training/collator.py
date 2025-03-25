@@ -150,7 +150,7 @@ class DataCollatorForVisionLanguageModeling(SimpleDataCollatorForVisionLanguage)
     """
 
     mlm: bool = True
-    mlm_probability: float = 0.25
+    mlm_probability: float = 0.5
     mask_replace_prob: float = 0.8
     random_replace_prob: float = 0.1
     pad_to_multiple_of: Optional[int] = None
@@ -225,14 +225,14 @@ class DataCollatorForVisionLanguageModeling(SimpleDataCollatorForVisionLanguage)
             & masked_indices
             & ~indices_replaced
         )
-        random_words = torch.randint(len(self.tokenizer), labels.shape, dtype=torch.long)
+        random_words = torch.randint(self.tokenizer.vocab_size, labels.shape, dtype=torch.long)
         inputs[indices_random] = random_words[indices_random]
 
         # The rest of the time ((1-random_replace_prob-mask_replace_prob)% of the time) we keep the masked input tokens unchanged
         return inputs, labels
     
 @dataclass
-class DataCollatorForSFT(SimpleDataCollatorForVisionLanguage):
+class DataCollatorForVisionLanguageSFT(SimpleDataCollatorForVisionLanguage):
     """
     Data collator used for supervised finetuning. Inputs are dynamically padded to the maximum length of a batch if they
     are not all of the same length.
