@@ -1,5 +1,9 @@
 import os
 
+import json
+
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -330,3 +334,24 @@ if __name__ == "__main__":
     print("bias w and grad:", lin.bias, lin.bias.grad)
     print("additional_fc.weight w and grad:", lin.additional_fc.weight, lin.additional_fc.weight.grad)
     print("additional_bias w and grad:", lin.additional_fc.bias, lin.additional_fc.bias.grad)
+
+@dataclass
+class FreezeConfig:
+    freeze_text_layers: bool = False
+    freeze_vision_layers: bool = False
+    freeze_lm_head: bool = False
+    freeze_text_module_exceptions: list = None
+    freeze_vision_module_exceptions: list = None
+
+    def __post_init__(self):
+        if self.freeze_text_module_exceptions is None:
+            self.freeze_text_module_exceptions = []
+        if self.freeze_vision_module_exceptions is None:
+            self.freeze_vision_module_exceptions = []
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(**d)
+
+    def to_dict(self):
+        return self.__dict__

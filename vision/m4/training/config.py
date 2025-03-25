@@ -100,11 +100,13 @@ class Hparams:
             ),
             tie_word_embeddings=False,
             # Freeze different parts of the model
-            freeze_lm_head=False,
-            freeze_text_layers=True,
-            freeze_text_module_exceptions=[],
-            freeze_vision_layers=True,
-            freeze_vision_module_exceptions=[],
+            freeze_config=dict(
+                freeze_lm_head=False,
+                freeze_text_layers=True,
+                freeze_text_module_exceptions=[],
+                freeze_vision_layers=True,
+                freeze_vision_module_exceptions=[]
+            ),
         )
     )
     lora_config: Dict[str, Any] = dict_field(
@@ -510,12 +512,12 @@ class Parameters(Serializable):
         if self.hparams.use_lora:
             has_vision_lora = any(["vision" in pattern for pattern in self.hparams.patterns_to_loraify])
             has_text_lora = any(["model.layers" in pattern for pattern in self.hparams.patterns_to_loraify])
-            if has_vision_lora and not self.hparams.model_config["freeze_vision_layers"]:
+            if has_vision_lora and not self.hparams.model_config["freeze_config"]["freeze_vision_layers"]:
                 raise ValueError(
                     "hparams.patterns_to_loraify suggests Lora is applied on the vision backbone, so"
                     " model_config.freeze_vision_layers should be True, but it is set to False"
                 )
-            if has_text_lora and not self.hparams.model_config["freeze_text_layers"]:
+            if has_text_lora and not self.hparams.model_config["freeze_config"]["freeze_text_layers"]:
                 raise ValueError(
                     "hparams.patterns_to_loraify,suggests Lora is applied on the text backbone, so"
                     " model_config.freeze_text_layers should be True, but it is set to False"
@@ -628,7 +630,7 @@ class Parameters(Serializable):
             self.save(self.hparams.save_dir / config_file_name)
 
 
-def get_config(print_config: bool = True):
+def get_config(print_config: bool = False):
     parameters: Parameters = Parameters.parse()
     if print_config:
         print(parameters)
