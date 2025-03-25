@@ -17,6 +17,8 @@ import copy
 import os
 from typing import Union
 
+from m4.models.custom_modules import FreezeConfig
+
 from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_rope_utils import rope_config_validation
@@ -348,12 +350,14 @@ class VLlama3Config(PretrainedConfig):
         self.mlp_bias = mlp_bias
 
         self.qk_layer_norms = qk_layer_norms
-        self.freeze_vision_layers = freeze_vision_layers
 
-        self.freeze_text_layers = freeze_text_layers
-        self.freeze_text_module_exceptions = freeze_text_module_exceptions
-        self.freeze_vision_module_exceptions = freeze_vision_module_exceptions
-        self.freeze_lm_head = freeze_lm_head
+        self.freeze_config = {
+            "freeze_text_layers": freeze_text_layers,
+            "freeze_text_module_exceptions": freeze_text_module_exceptions,
+            "freeze_lm_head": freeze_lm_head,
+            "freeze_vision_layers": freeze_vision_layers,
+            "freeze_vision_module_exceptions": freeze_vision_module_exceptions,
+        }
 
         self.use_resampler = use_resampler
         self._flash_attn_2_enabled = _flash_attn_2_enabled

@@ -5,9 +5,11 @@ from m4.models.idefics.modeling_idefics import IdeficsForCausalLM
 from m4.models.vgpt2.configuration_vgpt2 import VGPT2Config
 from m4.models.vgpt2.modeling_vgpt2 import VGPT2LMHeadModel
 from m4.models.vllama3.configuration_vllama3 import VLlama3Config
-from m4.models.vllama3.modeling_vllama3 import VLlama3ForCausalLM
+from m4.models.vllama3.modeling_vllama3 import VLlama3ForCausalLM, VLlama3ForMaskedLM
 from m4.models.vmistral.configuration_vmistral import VMistralConfig
 from m4.models.vmistral.modeling_vmistral import VMistralForCausalLM
+from m4.models.vbert.configuration_vbert import VBertConfig
+from m4.models.vbert.modeling_vbert import VBertForMaskedLM
 
 
 model_name2classes = {
@@ -16,6 +18,8 @@ model_name2classes = {
     r"mistral": [VMistralConfig, VMistralForCausalLM],
     r"llama": [VLlama3Config, VLlama3ForCausalLM],
     r"smollm": [VLlama3Config, VLlama3ForCausalLM],
+    r"smolvlm": [VLlama3Config, VLlama3ForCausalLM],
+    r"bert": [VLlama3Config, VLlama3ForMaskedLM],
 }
 
 

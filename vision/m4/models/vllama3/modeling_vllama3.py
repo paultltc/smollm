@@ -42,10 +42,11 @@ from transformers.utils import (
     is_flash_attn_greater_or_equal_2_10,
     replace_return_docstrings,
 )
+from transformers.models.bert.modeling_bert import BaseModelOutputWithPoolingAndCrossAttentions, MaskedLMOutput
 
 from m4.models import DecoupledEmbedding
 from m4.models.common import MLP, SimpleMLP
-from m4.models.custom_modules import VLOOMPreTrainedModelBase
+from m4.models.custom_modules import VLOOMPreTrainedModelBase, FreezeConfig
 from m4.models.perceiver.perceiver import PerceiverResampler
 from m4.models.vllama3.configuration_vllama3 import VLlama3Config
 from m4.training.setup_vision_model import vision_model_name_to_model
@@ -955,6 +956,8 @@ class VLlama3PreTrainedModel(VLOOMPreTrainedModelBase):
         elif isinstance(module, nn.Linear):
             if module.out_features == self.out_additional_features:
                 init_a_linear(module, std=(1.0 / (module.in_features)) ** 0.5)
+            else:
+                init_a_linear(module, std=(1.0 / (module.in_features)) ** 0.5)
 
 
     @classmethod
@@ -1061,7 +1064,7 @@ class VLlama3Model(VLlama3PreTrainedModel):
             num_embeddings=config.vocab_size,
             num_additional_embeddings=config.additional_vocab_size,
             embedding_dim=config.hidden_size,
-            partially_freeze=config.freeze_text_layers,
+            partially_freeze=config.freeze_config["freeze_text_layers"],
             padding_idx=self.padding_idx,
         )
 
@@ -1145,18 +1148,15 @@ class VLlama3Model(VLlama3PreTrainedModel):
         )
 
     def freeze_relevant_params(self, config=None):
-        if config is None:
-            config = self.config
+        config = config or self.config
+        freeze_config = FreezeConfig.from_dict(config.freeze_config)
 
-        if config.freeze_text_layers:
-            self.freeze_text_layers(config.freeze_text_module_exceptions)
+        if freeze_config.freeze_text_layers:
+            for module in [self.layers, self.norm]:
+                freeze_model(module, module_exceptions=freeze_config.freeze_text_module_exceptions)
 
-        if config.freeze_vision_layers:
-            freeze_model(self.vision_model, module_exceptions=config.freeze_vision_module_exceptions)
-
-    def freeze_text_layers(self, module_exceptions):
-        for module in [self.layers, self.norm]:
-            freeze_model(module, module_exceptions=module_exceptions)
+        if freeze_config.freeze_vision_layers:
+            freeze_model(self.vision_model, module_exceptions=freeze_config.freeze_vision_module_exceptions)
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1183,6 +1183,7 @@ class VLlama3Model(VLlama3PreTrainedModel):
         special_image_token_mask = input_ids == self.image_token_id
         new_inputs_embeds = inputs_embeds.clone()
         reshaped_image_hidden_states = image_hidden_states.view(-1, vision_hidden_size)
+        # logger.info(f"new_inputs_embeds: {new_inputs_embeds.shape}, reshaped_image_hidden_states: {reshaped_image_hidden_states.shape}, num images: {num_images}, image tokens: {special_image_token_mask.sum()}")
         new_inputs_embeds[special_image_token_mask] = reshaped_image_hidden_states
         return new_inputs_embeds
 
@@ -1481,7 +1482,7 @@ class VLlama3Model(VLlama3PreTrainedModel):
 
 
 class VLlama3ForCausalLM(VLlama3PreTrainedModel):
-    _tied_weights_keys = ["lm_head.weight"]
+    # _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config, vision_model=None):
         super().__init__(config)
@@ -1502,11 +1503,18 @@ class VLlama3ForCausalLM(VLlama3PreTrainedModel):
 
         self.lm_head = nn.Linear(in_features=config.hidden_size, out_features=config.vocab_size, bias=False)
         # self.lm_head = AutoModelForCausalLM.from_pretrained("HuggingFaceTB/SmolLM2-135M-Instruct").lm_head  # Why is the lm head not normally initialized?
-        if config.freeze_lm_head:
-            self.lm_head.requires_grad_(False)
 
         # Initialize weights and apply final processing
         self.post_init()
+
+        self.freeze_relevant_params(config)
+
+    def freeze_relevant_params(self, config=None):
+        config = config or self.config
+        freeze_config = FreezeConfig.from_dict(config.freeze_config)
+
+        if freeze_config.freeze_lm_head:
+            freeze_model(self.lm_head)
 
     def enable_input_require_grads(self):
         """
@@ -1840,7 +1848,235 @@ class VLlama3ForCausalLM(VLlama3PreTrainedModel):
             grad_acc_size=hparams.grad_acc_size,
             swiglu=False,
             vocab_size=None,
-            count_backward=not hparams.model_config["freeze_vision_layers"],
+            count_backward=not hparams.model_config["freeze_config"]["freeze_vision_layers"],
+            use_grad_checkpointing=hparams.gradient_checkpointing,
+        )
+        if self.config.use_resampler:
+            perceiver_tflops_per_batch_per_gpu = compute_perceiver_tflops_per_batch_per_gpu(
+                num_layers=self.config.perceiver_config.resampler_depth,
+                batch_size=hparams.batch_size_per_gpu * max_num_images,
+                q_seq_len=self.config.perceiver_config.resampler_n_latents,
+                vision_embed_seq_len=single_image_vision_encoder_seq_len,
+                q_k_v_input_dim=vision_hidden_size,
+                attention_hidden_size=self.config.perceiver_config.resampler_n_heads
+                * self.config.perceiver_config.resampler_head_dim,
+                ff_exp_factor=4,
+                count_backward=True,
+                use_grad_checkpointing=hparams.gradient_checkpointing,
+            )
+            tflop_count = (
+                language_tflops_per_batch_per_gpu
+                + modality_projection_tflops_per_batch_per_gpu
+                + perceiver_tflops_per_batch_per_gpu
+                + vision_tflops_per_batch_per_gpu
+            )
+        else:
+            tflop_count = (
+                language_tflops_per_batch_per_gpu
+                + modality_projection_tflops_per_batch_per_gpu
+                + vision_tflops_per_batch_per_gpu
+            )
+        return tflop_count
+    
+@dataclass
+class VLlama3MaskedLMOutput(MaskedLMOutput):
+    """
+    Base class for SmolVLM model's outputs that may also contain a past key/values (to speed up sequential decoding).
+    Args:
+        loss (`torch.FloatTensor`, *optional*, returned when `labels` is provided):
+            Masked language modeling (MLM) loss.
+        logits (`torch.FloatTensor`): 
+            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
+            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
+            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
+        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
+            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
+            sequence_length)`.
+            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
+            heads.
+        image_hidden_states (`tuple(torch.FloatTensor)`, *optional*):
+            Tuple of `torch.FloatTensor` (one for the output of the image embeddings, `(batch_size, num_images,
+            sequence_length, hidden_size)`.
+            image_hidden_states of the model produced by the vision encoder
+    """
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
+    image_hidden_states: Optional[torch.FloatTensor] = None
+
+class VLlama3ForMaskedLM(VLlama3PreTrainedModel):
+    _tied_weights_keys = ["predictions.decoder.bias", "cls.predictions.decoder.weight"]
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.vocab_size = config.vocab_size
+        self.image_token_id = self.config.image_token_id
+        self.in_features = config.hidden_size
+        self.out_features = config.vocab_size
+        self.out_additional_features = config.additional_vocab_size
+
+        self.model = VLlama3Model(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, False)
+        if self.out_additional_features > 0:
+            self.additional_fc = nn.Linear(
+                in_features=self.in_features,
+                out_features=self.out_additional_features,
+                bias=False,
+            )
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+        # Freeze relevant parameters
+        self.freeze_relevant_params(config)
+
+    def freeze_relevant_params(self, config=None):
+        config = config or self.config
+        freeze_config = FreezeConfig.from_dict(config.freeze_config)
+
+        if freeze_config.freeze_lm_head:
+            freeze_model(self.lm_head)
+
+    def forward(
+            self,
+            input_ids: torch.LongTensor = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            pixel_values: Optional[torch.FloatTensor] = None,
+            pixel_attention_mask: Optional[torch.BoolTensor] = None,
+            image_hidden_states: Optional[torch.FloatTensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, VLlama3MaskedLMOutput]:
+        r"""
+        Args:
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+                config.vocab_size]` or `model.image_token_id` (where `model` is your instance of `Idefics3ForConditionalGeneration`).
+                Tokens with indices set to `model.image_token_id` are ignored (masked), the loss is only
+                computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+        ```"""
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+
+        # Pass the inputs to VBertModel
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            pixel_attention_mask=pixel_attention_mask,
+            image_hidden_states=image_hidden_states,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        # Pass the outputs to the MLM head
+        hidden_states = outputs[0]
+        logits = self.lm_head(hidden_states)
+        if self.out_additional_features > 0:
+            additional_features = self.additional_fc(hidden_states)
+            logits = torch.cat((logits, additional_features), -1)
+        logits = logits.float()
+
+        masked_lm_loss = None
+        if labels is not None:
+            loss_fct = CrossEntropyLoss()  # -100 index = padding token
+            masked_lm_loss = loss_fct(logits.view(-1, self.config.vocab_size + self.out_additional_features), labels.view(-1))
+
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
+
+        return VLlama3MaskedLMOutput(
+            loss=masked_lm_loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            image_hidden_states=outputs.image_hidden_states,
+        )
+
+
+    def get_model_tflops_per_batch_per_gpu(self, hparams, data_param, tokenizer, max_num_images, max_num_tokens=None):
+        config_vl_model = self.config
+
+        language_embed_size = config_vl_model.hidden_size
+        num_language_layers = config_vl_model.num_hidden_layers
+        ffn_inner_size = config_vl_model.intermediate_size
+
+        vision_config = config_vl_model.vision_config
+
+        # Get vision model blocks infos
+        vision_patch_size = vision_config.patch_size
+        vision_hidden_size = vision_config.embed_dim
+        num_vision_layers = vision_config.num_hidden_layers
+        # The +1 is for the CLS token
+        single_image_vision_encoder_seq_len = int(((vision_config.image_size // vision_patch_size) ** 2) // (self.config.pixel_shuffle_factor**2))
+        vision_exp_factor = vision_config.intermediate_size // vision_hidden_size
+
+        # Get language blocks infos
+        language_seq_len = max_num_tokens if max_num_tokens is not None else data_param.max_seq_len
+        language_exp_factor = (ffn_inner_size // language_embed_size) if ffn_inner_size is not None else 4
+
+        # Get modality projection infos
+        vision_pipeline_output_seq_len = (
+            self.config.perceiver_config.resampler_n_latents
+            if self.config.use_resampler
+            else single_image_vision_encoder_seq_len
+        )
+
+        language_tflops_per_batch_per_gpu = compute_tflops_per_batch_per_gpu(
+            num_layers=num_language_layers,
+            batch_size=hparams.batch_size_per_gpu,
+            q_seq_len=language_seq_len,
+            k_seq_len=language_seq_len,
+            hidden_size=language_embed_size,
+            kv_in_dim=language_embed_size,
+            ff_exp_factor=language_exp_factor,
+            grad_acc_size=hparams.grad_acc_size,
+            swiglu=True,
+            vocab_size=tokenizer.vocab_size,
+            count_backward=True,  # Always True regardless of freezing, because gradients are computed for vision adaptor
+            use_grad_checkpointing=hparams.gradient_checkpointing,
+        )
+        modality_projection_tflops_per_batch_per_gpu = compute_linear_tflops_per_batch_per_gpu(
+            batch_size=hparams.batch_size_per_gpu * max_num_images,
+            seq_len=vision_pipeline_output_seq_len,
+            in_features=vision_hidden_size,
+            out_features=language_embed_size,
+            count_backward=True,
+            use_grad_checkpointing=hparams.gradient_checkpointing,
+        )
+
+        vision_tflops_per_batch_per_gpu = compute_tflops_per_batch_per_gpu(
+            num_layers=num_vision_layers,
+            batch_size=hparams.batch_size_per_gpu * max_num_images,
+            q_seq_len=single_image_vision_encoder_seq_len,
+            k_seq_len=single_image_vision_encoder_seq_len,
+            hidden_size=vision_hidden_size,
+            kv_in_dim=vision_hidden_size,
+            ff_exp_factor=vision_exp_factor,
+            grad_acc_size=hparams.grad_acc_size,
+            swiglu=False,
+            vocab_size=None,
+            count_backward=not hparams.model_config["freeze_config"]["freeze_vision_layers"],
             use_grad_checkpointing=hparams.gradient_checkpointing,
         )
         if self.config.use_resampler:
