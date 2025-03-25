@@ -6,12 +6,11 @@ import json
 import logging
 import random
 
-import fitz
 import PIL.Image
 import webdataset as wds
 from webdataset.tariterators import group_by_keys, tar_file_expander, url_opener
 
-from m4.training.types import DatasetTypes
+from m4.training.enums import DatasetTypes
 
 
 meta_prefix = "__"
@@ -236,6 +235,7 @@ def _decode_pdf_pages(
     sample,
     num_anno_pages,
 ):
+    import fitz
     image_fmt = "L"
     with io.BytesIO(sample["pdf"]) as b:
         # FIXME test and use an alternate pdf reader/render as default

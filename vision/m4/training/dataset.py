@@ -31,7 +31,7 @@ from m4.training.enums import DatasetNames, DatasetTypes, MaskingTypes
 from m4.training.collator import (
     SimpleDataCollatorForVisionLanguage, 
     DataCollatorForVisionLanguageModeling, 
-    DataCollatorForSFT
+    DataCollatorForVisionLanguageSFT
 )
 
 
@@ -100,8 +100,8 @@ def simple_collate(x):
     return x[0]
 
 collators_map = {
-    "mlm": DataCollatorForVisionLanguageModeling,
-    "sft": DataCollatorForSFT,
+    MaskingTypes.MLM: DataCollatorForVisionLanguageModeling,
+    MaskingTypes.SFT: DataCollatorForVisionLanguageSFT,
 }
 
 def get_mapper(
@@ -163,6 +163,7 @@ def get_mapper(
     mapper_with_args = partial(split_fn, **mapper_kwargs)
 
     collator_class = collators_map.get(mask_type, SimpleDataCollatorForVisionLanguage)
+    logger.info(f"Using collator: {collator_class.__name__}")
     collator = collator_class(
         processor=mapper_with_args,
         tokenizer=tokenizer, 
