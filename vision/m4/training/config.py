@@ -1,9 +1,16 @@
 import json
+import os
 import logging
 import time
 from dataclasses import InitVar, asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from transformers import PretrainedConfig, PreTrainedModel, PreTrainedTokenizer
+from transformers import AddedToken  # AddedToken is needed for the eval of the tokenizer params # noqa: F401
+from transformers import AutoTokenizer  # noqa: F401
+
+from peft import LoraConfig, PeftConfig
 
 # import git
 import yaml
@@ -11,8 +18,9 @@ from simple_parsing import ArgumentParser, Serializable
 from simple_parsing.helpers import dict_field, list_field
 
 from m4.training.enums import DatasetNames, DatasetTypes, MaskingTypes
-from m4.training.utils import LoggingTypes
+from m4.training.utils import LoggingTypes, get_tokenizer
 
+from m4.training.setup_language_model import model_name_to_classes
 
 logger = logging.getLogger(__name__)
 
@@ -85,12 +93,16 @@ class Hparams:
     # The value of the string will evaluated (i.e. interpreted). Unnecessary if tokenizer has a `pad_token`.
     tokenizer_add_special_tokens: str = "{}"
     model_name: str = "HuggingFaceM4/tiny-random-LlamaForCausalLM"
+    # model_type: str = "llama"
     lora_name: Optional[str] = None
     revision: str = "main"
     model_config: Dict[str, Any] = dict_field(
         dict(
             vision_config=dict(
                 vision_model_name=None,
+            ),
+            text_config=dict(
+                text_model_name=None,
             ),
             perceiver_config=dict(
                 resampler_n_latents=64,
@@ -200,6 +212,41 @@ class Hparams:
     patterns_to_loraify: Optional[List[List[str]]] = list_field(["model.layers", "proj"])
     patterns_to_unfreeze: Optional[List[List[str]]] = list_field(["perceiver"], ["modality"], ["additional"])
 
+    def __post_init__(self):
+        if self.global_batch_size is not None:
+            logger.warning(
+                "global_batch_size is deprecated, please use global_batch_size_ramp_up instead. "
+                "global_batch_size will be ignored."
+            )
+        if self.global_batch_size_ramp_up.start is not None:
+            self.global_batch_size = self.global_batch_size_ramp_up.start
+
+        if self.global_batch_size_ramp_up.start is not None and self.global_batch_size_ramp_up.finish is not None:
+            if self.global_batch_size_ramp_up.increment is None:
+                raise ValueError("increment must be set when start and finish are set")
+            if self.global_batch_size_ramp_up.samples is None:
+                raise ValueError("samples must be set when start and finish are set")
+            
+    @property
+    def model_type(self):
+        return self.model_name
+
+    @property
+    def model_classes(self) -> Tuple[PretrainedConfig, PreTrainedModel]:
+        return model_name_to_classes(self.model_type)
+
+    def get_model_classes(self) -> Tuple[PretrainedConfig, PreTrainedModel]:
+        return self.model_classes
+
+    def get_tokenizer(self, model_vocab_size: int) -> PreTrainedTokenizer:
+        return get_tokenizer(
+            tokenizer_name=self.tokenizer_name,
+            tokenizer_add_tokens=self.tokenizer_add_tokens,
+            tokenizer_add_special_tokens=self.tokenizer_add_special_tokens,
+            tokenizer_params=self.tokenizer_params,
+            model_vocab_size=model_vocab_size,
+            is_fine_tuning=self.is_fine_tuning,
+        )
 
 @dataclass
 class ResumeParams:
@@ -230,8 +277,8 @@ class DatasetParams:
     max_num_images: int = 5
     # maximum sequence length
     max_seq_len: int = 256
-    training_datasets_paths: Path | List[Path] = list_field()
-    validation_datasets_paths: Path | List[Path] = list_field()
+    training_datasets_paths: str | Path | List[Path] = list_field()
+    validation_datasets_paths: str | Path | List[Path] = list_field()
     # if True, instead of split and pack, each instance in sample will be
     # either truncated or padded to the same length.
     pad_dataset: bool = True
@@ -273,11 +320,20 @@ class DatasetParams:
     vision_encoder_max_image_size: int = 0
 
     def __post_init__(self):
-        if isinstance(self.training_datasets_paths, Path):
-            self.training_datasets_paths = [self.training_datasets_paths]
-        if isinstance(self.validation_datasets_paths, Path):
-            self.validation_datasets_paths = [self.validation_datasets_paths]
+        if isinstance(self.training_datasets_paths, str):
+            if self.training_datasets_paths.endswith(".txt") and os.path.exists(self.training_datasets_paths):
+                with open(self.training_datasets_paths, "r") as f:
+                    self.training_datasets_paths = f.read().splitlines()
+            else:
+                self.training_datasets_paths = [self.training_datasets_paths]
 
+        if isinstance(self.validation_datasets_paths, str):
+            if self.validation_datasets_paths.endswith(".txt") and os.path.exists(self.validation_datasets_paths):
+                with open(self.validation_datasets_paths, "r") as f:
+                    self.validation_datasets_paths = f.read().splitlines()
+            else:
+                self.validation_datasets_paths = [self.validation_datasets_paths]
+    
 @dataclass
 class ImageCaptionPairedDatasetParams(DatasetParams):
     dataset_type: DatasetTypes = DatasetTypes.IMAGE_CAPTION_PAIRS
@@ -527,6 +583,10 @@ class Parameters(Serializable):
             LoggingTypes(val) for val in self.hparams.train_logging_grad_param_deepspeed
         ]
 
+        if self.hparams.save_dir is not None:
+            # make dir if needed
+            self.hparams.save_dir.mkdir(parents=True, exist_ok=True)
+
         # Resume run if there is already an existing folder for this run
         if self.hparams.save_dir is not None and self.hparams.save_dir.exists():
             save_dir_has_checkpoints = (
@@ -629,6 +689,70 @@ class Parameters(Serializable):
                 config_file_name = "config.yaml"
             self.save(self.hparams.save_dir / config_file_name)
 
+    def get_model_classes(self) -> Tuple[PretrainedConfig, PreTrainedModel]:
+        return self.hparams.get_model_classes()
+
+    def get_tokenizer(self, model_vocab_size: int) -> PreTrainedTokenizer:
+        return self.hparams.get_tokenizer(model_vocab_size=model_vocab_size)
+
+    def load_model(self, torch_dtype) -> PreTrainedModel:
+        config_class, model_class = self.get_model_classes()
+
+        # we want the target dtype in order to load the model is the most optimal way
+        model_kwargs = dict(torch_dtype=torch_dtype)
+
+        # Case when resuming run. For both pretraining and fine tuning
+        if self.hparams.resume_run:
+            logger.info("Using saved model")
+            vl_model = model_class.from_pretrained(
+                self.resume_param.model_file,
+                config=self.resume_param.model_config_file,
+                is_resume=True,
+                **model_kwargs,
+            )
+            if self.hparams.use_lora:
+                peft_config = PeftConfig.from_pretrained(self.resume_param.lora_file)
+                vl_model.add_adapter(peft_config)
+                vl_model.enable_adapters()
+                logger.info("Resuming training with trained adapter")
+        # Case when starting fine tuning
+        elif self.hparams.is_fine_tuning:
+            # Additionnal vocabulary can be 3 instead of 2 for finetuning to integrate the <end_of_utterance> token
+            # However, if we want to keep training a model from the hub without <end_of_utterance> token. This works as well
+            additional_vocab_size = 39 + len(eval(self.hparams.tokenizer_add_tokens))
+            print(f"additional_vocab_size: {additional_vocab_size}")
+            logger.warning(
+                "This is a fine tuning procedure, so the model parameters are inherited from the base model EXCEPT those"
+                " regarding freezing and additional vocabulary. Finetuning with an additional vocab size of"
+                f" {additional_vocab_size}"
+            )
+            vl_model = model_class.from_pretrained(
+                self.hparams.model_name,
+                is_resume=False,
+                new_model=False,
+                trust_remote_code=True,
+                freeze_config=self.hparams.model_config["freeze_config"],
+                additional_vocab_size=additional_vocab_size,
+                **model_kwargs,
+            )
+            if self.hparams.use_lora and self.hparams.lora_name is not None:
+                vl_model.load_adapter(self.hparams.lora_name)
+                vl_model.enable_adapters()
+                logger.info("Loaded trained adapter")
+        # Standard case for starting a pretraining
+        else:
+            logger.info("Using newly initialized model")
+            # vl_config = config_class(**self.hparams.model_config)
+            vl_config = config_class.from_pretrained(
+                self.hparams.model_name,
+                revision=self.hparams.revision,
+                new_model=True,
+                additional_vocab_size=len(eval(self.hparams.tokenizer_add_tokens)),
+                **self.hparams.model_config,
+            )
+            vl_model = model_class.from_pretrained_models(self.hparams.model_name, config=vl_config, **model_kwargs)
+
+        return vl_model
 
 def get_config(print_config: bool = False):
     parameters: Parameters = Parameters.parse()

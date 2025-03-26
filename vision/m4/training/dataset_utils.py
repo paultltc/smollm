@@ -19,6 +19,12 @@ meta_suffix = "__"
 logger = logging.getLogger(__name__)
 trace = False
 
+def paths_to_wds_commands(paths: str, token: str=None):
+    """Convert a list of paths to webdataset commands."""
+    if token is None:
+        return [f"pipe:bash -c 'curl -s -L {path} | tar xf -'" for path in paths]
+    else:
+        return [f"pipe:bash -c 'curl -s -L {path} -H \"Authorization:Bearer {token}\" | tar xf -'" for path in paths]
 
 def check_webdataset_command(command):
     if "s3:/" not in command:

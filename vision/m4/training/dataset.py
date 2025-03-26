@@ -19,7 +19,7 @@ from PIL import Image, ImageFile
 from torch.utils.data import Sampler
 
 from m4.training.config import DataParams, DatasetParams, Parameters
-from m4.training.dataset_utils import check_webdataset_command, get_webdataset
+from m4.training.dataset_utils import check_webdataset_command, get_webdataset, paths_to_wds_commands
 from m4.training.packing import (
     split_pack_and_pad_iqa_finetuning,
     split_pack_and_pad_ocr,
@@ -325,12 +325,8 @@ def get_dataset_webdataset(
     if len(webdataset_paths) == 0:
         return None
 
-    # webdataset_paths can be a list of paths/commands, or a .txt file path that contains the paths
-    if len(webdataset_paths) == 1 and str(webdataset_paths[0]).endswith(".txt"):
-        with open(webdataset_paths[0], "r") as file_shards:
-            webdataset_paths = [path for path in file_shards.read().split("\n") if path]
-    else:
-        raise ValueError("WebDataset only supports a .txt file with the paths or the commands.")
+    # Adapt the paths to the webdataset command format
+    webdataset_paths = paths_to_wds_commands(webdataset_paths, token=os.environ.get("HF_TOKEN"))
 
     # Check if the paths/commands are valid
     checks = all([check_webdataset_command(path) for path in webdataset_paths])
@@ -898,7 +894,6 @@ class IterableWrapperWebdataset(torch.utils.data.IterableDataset):
     def __init__(
         self,
         dataset,
-        collator_fn,
         tokenizer,
         image_transform,
         batch_size,
@@ -1059,7 +1054,7 @@ class IterableWrapperWebdataset(torch.utils.data.IterableDataset):
                 break
             curr_mapped_batch = self.mapper(
                 next_batch,
-                prefix_seed=(self.seed, self.epoch, self.rank, worker_id, i),
+                # prefix_seed=(self.seed, self.epoch, self.rank, worker_id, i),
             )
             torch.set_rng_state(rng_state)
             keys = list(curr_mapped_batch.keys())
