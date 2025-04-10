@@ -8,6 +8,8 @@ from contextlib import contextmanager
 from enum import Enum
 from functools import partial
 
+import re
+
 import accelerate
 import albumentations as alb
 import cv2
@@ -216,7 +218,7 @@ nougat_transform = alb_wrapper(
             ),
             alb.Compose(
                 [
-                    alb.Affine(translate_px=(0, 5), always_apply=True, cval=(255, 255, 255)),
+                    alb.Affine(translate_px=(0, 5), p=1.0, cval=(255, 255, 255)),
                     alb.ElasticTransform(
                         p=1,
                         alpha=50,
@@ -229,8 +231,8 @@ nougat_transform = alb_wrapper(
                 p=0.04,
             ),
             alb.RandomBrightnessContrast(0.1, 0.1, True, p=0.03),
-            alb.ImageCompression(95, p=0.07),
-            alb.GaussNoise(20, p=0.08),
+            alb.ImageCompression(quality_range=(95,100), p=0.07),
+            alb.GaussNoise(p=0.08),
             alb.GaussianBlur((3, 3), p=0.03),
         ]
     )
@@ -510,10 +512,9 @@ def image_splitting(
 
 def get_tokenizer(
     tokenizer_name: str,
-    tokenizer_add_tokens,
-    tokenizer_add_special_tokens,
-    tokenizer_params,
-    additional_vocab_size,
+    tokenizer_add_tokens: str,
+    tokenizer_add_special_tokens: str,
+    tokenizer_params: str,
     model_vocab_size=None,
     is_fine_tuning=False,
 ):
@@ -525,6 +526,9 @@ def get_tokenizer(
     NB: we constraint to tokenizer to be a fast tokenizer because with the slow tokenizer, we can't set the arguments of the added tokens (cf `.add_tokens`) and by default, the separators are stripped.
     """
     tokenizer_params = eval(tokenizer_params)
+    add_tokens = eval(tokenizer_add_tokens)
+    add_special_tokens = eval(tokenizer_add_special_tokens)
+
     assert isinstance(tokenizer_params, dict)
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, legacy=False, **tokenizer_params)
@@ -550,24 +554,24 @@ def get_tokenizer(
         if "additional_special_tokens" in tokenizer.special_tokens_map_extended
         else []
     )
-    add_special_tokens_dict = {"additional_special_tokens": existing_special_tokens + eval(tokenizer_add_tokens)}
+    add_special_tokens_dict = {"additional_special_tokens": existing_special_tokens + add_tokens}
     if tokenizer_add_special_tokens is not None:
-        add_special_tokens_dict.update(eval(tokenizer_add_special_tokens))
+        add_special_tokens_dict.update(add_special_tokens)
 
     tokenizer.add_special_tokens(add_special_tokens_dict)
-    if is_fine_tuning and len(eval(tokenizer_add_tokens)) > 0:
-        assert str(eval(tokenizer_add_tokens)[-1]) == END_OF_UTTERANCE_TOKEN
+    if is_fine_tuning and len(add_tokens) > 0:
+        assert str(add_tokens[-1]) == END_OF_UTTERANCE_TOKEN
         assert END_OF_UTTERANCE_TOKEN in tokenizer.convert_ids_to_tokens(
-            [idx for idx in range(len(tokenizer) - additional_vocab_size, len(tokenizer))]
+            [idx for idx in range(len(tokenizer) - len(add_tokens), len(tokenizer))]
         )
-    elif not is_fine_tuning and len(eval(tokenizer_add_tokens)) > 0:
-        assert str(eval(tokenizer_add_tokens)[-1]) == IMAGE_TOKEN
-        assert str(eval(tokenizer_add_tokens)[-2]) == FAKE_TOKEN_AROUND_IMAGE_V2
+    elif not is_fine_tuning and len(add_tokens) > 0:
+        assert str(add_tokens[-1]) == IMAGE_TOKEN
+        assert str(add_tokens[-2]) == FAKE_TOKEN_AROUND_IMAGE_V2
         assert IMAGE_TOKEN in tokenizer.convert_ids_to_tokens(
-            [idx for idx in range(len(tokenizer) - additional_vocab_size, len(tokenizer))]
+            [idx for idx in range(len(tokenizer) - len(add_tokens), len(tokenizer))]
         )
         assert FAKE_TOKEN_AROUND_IMAGE_V2 in tokenizer.convert_ids_to_tokens(
-            [idx for idx in range(len(tokenizer) - additional_vocab_size, len(tokenizer))]
+            [idx for idx in range(len(tokenizer) - len(add_tokens), len(tokenizer))]
         )
     # This verifies that `<image>` was correctly added to the tokenizer vocabulary
     # XXX: opt-1.3b fails here
@@ -1034,3 +1038,17 @@ def lora_unload(model):
         if hasattr(target, "base_layer"):
             lora_replace_module(parent, target_name, target.get_base_layer(), target)
     return model
+
+
+def regex_lookup(s, map):
+    """returns the first match of the regex in the string"""
+
+    model_name_lowcase = s.lower()
+    for rx, lookup in map.items():
+        if re.search(rx, model_name_lowcase):
+            return lookup
+    else:
+        raise ValueError(
+            f"Unknown type of input. Got {s}, supported regexes:"
+            f" {list(map.keys())}."
+        )

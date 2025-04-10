@@ -6,6 +6,12 @@ import json
 import logging
 import random
 
+import os
+
+import tarfile
+from io import BytesIO
+import requests 
+
 import PIL.Image
 import webdataset as wds
 from webdataset.tariterators import group_by_keys, tar_file_expander, url_opener
@@ -22,9 +28,9 @@ trace = False
 def paths_to_wds_commands(paths: str, token: str=None):
     """Convert a list of paths to webdataset commands."""
     if token is None:
-        return [f"pipe:bash -c 'curl -s -L {path} | tar xf -'" for path in paths]
+        return [f"pipe:curl -s -L {path}" for path in paths]
     else:
-        return [f"pipe:bash -c 'curl -s -L {path} -H \"Authorization:Bearer {token}\" | tar xf -'" for path in paths]
+        return [f"pipe:curl -s -L {path} -H 'Authorization:Bearer {token}'" for path in paths]
 
 def check_webdataset_command(command):
     if "s3:/" not in command:
@@ -361,8 +367,12 @@ def _get_web_dataset(
     shuffle_after_tarfile_to_samples_buffer_size=100,
     shuffle_after_batching_buffer_size=1000,
 ):
+    # Optionally shuffle the URLs
     if shuffle_initial_urls_list:
         random.shuffle(urls)
+
+    # urls to command
+    urls = paths_to_wds_commands(urls, token=os.getenv("HF_TOKEN"))
 
     pipeline_list = [wds.SimpleShardList(urls)]
 
@@ -374,6 +384,7 @@ def _get_web_dataset(
     if shuffle_before_split_by_worker_buffer_size is not None:
         pipeline_list.append(wds.shuffle(shuffle_before_split_by_worker_buffer_size))
 
+    # Main processing pipeline
     pipeline_list.extend(tar_to_samples_ops)
 
     if shuffle_after_tarfile_to_samples_buffer_size is not None:
@@ -384,8 +395,7 @@ def _get_web_dataset(
     if shuffle_after_batching_buffer_size is not None:
         pipeline_list.append(wds.shuffle(shuffle_after_batching_buffer_size))
 
-    dataset = wds.DataPipeline(pipeline_list)
-    return dataset
+    return wds.DataPipeline(*pipeline_list)
 
 
 def get_webdataset(

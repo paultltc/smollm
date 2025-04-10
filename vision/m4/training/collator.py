@@ -58,8 +58,12 @@ class SimpleDataCollatorForVisionLanguage(DataCollatorMixin):
     return_tensors: str = "pt"
 
     def __post_init__(self):
-        if self.tokenizer is None:
+        if self.tokenizer is None and hasattr(self.processor, "tokenizer"):
             self.tokenizer = self.processor.tokenizer
+        else:
+            raise ValueError(
+                "You need to specify a tokenizer to use `DataCollatorForVisionLanguage` collators."
+            )
 
     @property
     def image_token_id(self) -> int:

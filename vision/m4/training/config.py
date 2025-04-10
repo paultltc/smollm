@@ -429,6 +429,7 @@ class DataParams(Serializable):
 
     # Type of masking to use for the training data
     mask_type: Optional[MaskingTypes] = None
+    collator_args: Dict[str, Any] = dict_field()
 
     # TODO: Move to per dataset params as it makes more sense there
     proba_interleaving_dataset: Optional[List[float]] = None

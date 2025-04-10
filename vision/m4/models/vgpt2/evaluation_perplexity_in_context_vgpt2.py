@@ -9,7 +9,7 @@ from transformers import AutoTokenizer
 from m4.evaluation.custom_metrics.perplexity_metrics import MetricsPerplexity
 from m4.evaluation.tasks import BaseTask, Predictor
 from m4.evaluation.utils import EvaluationVersion
-from m4.training.types import DatasetTypes
+from m4.training.enums import DatasetTypes
 from m4.training.utils import (
     FAKE_TOKEN_AROUND_IMAGE_V1,
     FAKE_TOKEN_AROUND_IMAGE_V2,

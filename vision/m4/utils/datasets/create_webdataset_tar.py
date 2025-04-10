@@ -15,7 +15,7 @@ from datasets import DatasetDict, concatenate_datasets
 from pathos.multiprocessing import ProcessingPool as Pool
 
 from m4.training.dataset import load_hf_dataset
-from m4.training.types import DatasetTypes
+from m4.training.enums import DatasetTypes
 from m4.training.utils import _convert_to_rgb
 
 

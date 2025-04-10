@@ -123,8 +123,6 @@ def get_mapper(
     add_begin_of_doc_token: bool = True,
     add_end_of_doc_token: bool = True,
     max_num_images_per_document: Optional[int] = None,
-    mask_type: MaskingTypes = None,
-    **collator_kwargs
 ):
     mapper_kwargs = {
         "tokenizer": tokenizer,
@@ -162,15 +160,7 @@ def get_mapper(
 
     mapper_with_args = partial(split_fn, **mapper_kwargs)
 
-    collator_class = collators_map.get(mask_type, SimpleDataCollatorForVisionLanguage)
-    logger.info(f"Using collator: {collator_class.__name__}")
-    collator = collator_class(
-        processor=mapper_with_args,
-        tokenizer=tokenizer, 
-        **collator_kwargs
-    )
-
-    return collator
+    return mapper_with_args
 
 
 def get_dataloaders(
@@ -298,7 +288,6 @@ def get_dataset_hf(
                 pre_split_scale_up_frequency=dataset_config.pre_split_scale_up_frequency,
                 dataset_type=DatasetTypes.IMAGE_CAPTION_PAIRS if is_paired_dataset else DatasetTypes.WEB_DOCUMENTS,
                 is_t5=is_t5,
-                mask_type=mask_type,
                 **optional_kwargs,
             )
             hf_dataset = hf_dataset.map(
@@ -324,9 +313,6 @@ def get_dataset_webdataset(
 
     if len(webdataset_paths) == 0:
         return None
-
-    # Adapt the paths to the webdataset command format
-    webdataset_paths = paths_to_wds_commands(webdataset_paths, token=os.environ.get("HF_TOKEN"))
 
     # Check if the paths/commands are valid
     checks = all([check_webdataset_command(path) for path in webdataset_paths])
@@ -399,7 +385,8 @@ def get_dataloader(
     model_name=None,
     data_param: Optional[DataParams] = None,
     image_seq_len=None,
-    mask_type: MaskingTypes = None
+    mask_type: MaskingTypes = None,
+    **collator_kwargs,
 ):
     if is_train:
         select_n_examples = data_param.select_n_examples_train
@@ -485,24 +472,37 @@ def get_dataloader(
             else:
                 raise ValueError("Type unrecognized")
 
+            # MAPPER
             dataset_config: DatasetParams = getattr(data_param, dataset_name.name.lower())
             dataset_kwargs = asdict(dataset_config)
-            signature = inspect.signature(wrapper_dataset_class.__init__)
+            signature = inspect.signature(get_mapper)
             dataset_kwargs = {k: v for k, v in dataset_kwargs.items() if k in signature.parameters}
-            iterable_dataset_instance = wrapper_dataset_class(
-                combined_dataset,
+            mapper = get_mapper(
                 tokenizer=tokenizer,
                 image_transform=image_transforms[dataset_name.name.lower()],
+                image_seq_len=image_seq_len,
+                **dataset_kwargs,
+            )  
+            # COLLATOR
+            collator_class = collators_map.get(mask_type, SimpleDataCollatorForVisionLanguage)
+            logger.info(f"Using collator: {collator_class.__name__}")
+            collator_kwargs = {k: v for k,v in collator_kwargs.items() if k in inspect.signature(collator_class).parameters}
+            collator = collator_class(
+                processor=mapper,
+                tokenizer=tokenizer, 
+                **collator_kwargs
+            ) 
+            # Create the IterableWrapperDataset instance
+            iterable_dataset_instance = wrapper_dataset_class(
+                combined_dataset,
+                dataset_name=dataset_name,
+                mapper=collator,
                 batch_size=batch_size,
                 seed=seed,
                 shuffle=is_train,
                 rank=rank,
                 world_size=world_size,
                 drop_last=True,
-                is_t5=is_t5,
-                mask_type=mask_type,
-                image_seq_len=image_seq_len,
-                **dataset_kwargs,
             )
             realtime_processing_datasets.append(iterable_dataset_instance)
 
@@ -557,6 +557,7 @@ def get_dataloader_from_config(
         data_param=config.data_param,
         image_seq_len=image_seq_len,
         mask_type=config.data_param.mask_type,
+        **config.data_param.collator_args,
     )
     return dataloader
 
@@ -645,59 +646,19 @@ class IterableWrapperHFDataset(torch.utils.data.IterableDataset):
     def __init__(
         self,
         dataset,
-        tokenizer,
-        image_transform,
+        mapper,
         batch_size,
         seed,
-        dataset_type,
         dataset_name,
-        image_seq_len,
         shuffle=True,
         rank=None,
         world_size=None,
         drop_last=True,
-        is_t5=False,
-        mask_type=None,
-        # Dataset specific params
-        max_num_images=5,
-        max_seq_len=256,
-        max_image_size=384,
-        vision_encoder_max_image_size=384,
-        pre_split_scale_up_max=1.0,
-        pre_split_scale_up_frequency=0.0,
-        pad_dataset=True,
         mapper_batch_size=128,
-        # Setting default to 0 as PMD doesn't need it and it is set to 0.5 in CM4 config by default
-        max_num_samples_per_document=1,
-        t5_mlm_noise_density=None,
-        t5_mlm_mean_noise_span_length=None,
-        add_begin_of_doc_token=True,
-        add_end_of_doc_token=True,
         shuffle_after_packing=False,
-        max_num_images_per_document=None,
     ):
         self.dataset = dataset
-        self.mapper = get_mapper(
-            tokenizer=tokenizer,
-            image_transform=image_transform,
-            image_seq_len=image_seq_len,
-            max_seq_len=max_seq_len,
-            max_num_images=max_num_images,
-            max_image_size=max_image_size,
-            vision_encoder_max_image_size=vision_encoder_max_image_size,
-            pre_split_scale_up_max=pre_split_scale_up_max,
-            pre_split_scale_up_frequency=pre_split_scale_up_frequency,
-            pad_dataset=pad_dataset,
-            max_num_samples_per_document=max_num_samples_per_document,
-            dataset_type=dataset_type,
-            is_t5=is_t5,
-            t5_mlm_noise_density=t5_mlm_noise_density,
-            t5_mlm_mean_noise_span_length=t5_mlm_mean_noise_span_length,
-            add_begin_of_doc_token=add_begin_of_doc_token,
-            add_end_of_doc_token=add_end_of_doc_token,
-            max_num_images_per_document=max_num_images_per_document,
-            mask_type=mask_type
-        )
+        self.mapper = mapper
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.seed = seed
@@ -706,6 +667,8 @@ class IterableWrapperHFDataset(torch.utils.data.IterableDataset):
         self.world_size = world_size
         self.mapper_batch_size = mapper_batch_size
         self.drop_last = drop_last
+
+        self.mapper = mapper
 
         self.shuffle_after_packing = shuffle_after_packing
 
@@ -894,60 +857,20 @@ class IterableWrapperWebdataset(torch.utils.data.IterableDataset):
     def __init__(
         self,
         dataset,
-        tokenizer,
-        image_transform,
+        mapper,
         batch_size,
         seed,
-        dataset_type,
         dataset_name,
-        image_seq_len,
         shuffle=True,
         rank=None,
         world_size=None,
         drop_last=True,
-        is_t5=False,
-        mask_type=None,
-        # Dataset specific params
-        max_num_images=5,
-        max_seq_len=256,
-        max_image_size=384,
-        vision_encoder_max_image_size=384,
-        pre_split_scale_up_max=1.0,
-        pre_split_scale_up_frequency=0.0,
-        pad_dataset=True,
         mapper_batch_size=128,
-        # Setting default to 0 as PMD doesn't need it and it is set to 0.5 in CM4 config by default
-        max_num_samples_per_document=1,
-        t5_mlm_noise_density=None,
-        t5_mlm_mean_noise_span_length=None,
-        add_begin_of_doc_token=True,
-        add_end_of_doc_token=True,
         shuffle_after_packing=False,
-        max_num_images_per_document=None,
     ):
         self._webdataset = dataset
         self.dataset = iter(self._webdataset)
-        self.mapper = get_mapper(
-            tokenizer=tokenizer,
-            image_transform=image_transform,
-            image_seq_len=image_seq_len,
-            max_seq_len=max_seq_len,
-            max_num_images=max_num_images,
-            max_image_size=max_image_size,
-            vision_encoder_max_image_size=vision_encoder_max_image_size,
-            pre_split_scale_up_max=pre_split_scale_up_max,
-            pre_split_scale_up_frequency=pre_split_scale_up_frequency,
-            pad_dataset=pad_dataset,
-            max_num_samples_per_document=max_num_samples_per_document,
-            dataset_type=dataset_type,
-            is_t5=is_t5,
-            t5_mlm_noise_density=t5_mlm_noise_density,
-            t5_mlm_mean_noise_span_length=t5_mlm_mean_noise_span_length,
-            add_begin_of_doc_token=add_begin_of_doc_token,
-            add_end_of_doc_token=add_end_of_doc_token,
-            max_num_images_per_document=max_num_images_per_document,
-            mask_type=mask_type
-        )
+        self.mapper = mapper
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.seed = seed

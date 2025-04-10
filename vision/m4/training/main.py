@@ -20,10 +20,9 @@ from transformers.utils import ContextManagers, is_torch_tf32_available
 import m4
 from m4.training.config import get_config
 from m4.training.dataset import get_dataloaders
-from m4.training.setup_language_model import model_name_to_classes
 from m4.training.trainer import Trainer
-from m4.training.types import DatasetNames
-from m4.training.utils import VisionEncoderTypes, accelerate_torch_dtype, build_image_transform, get_tokenizer
+from m4.training.enums import DatasetNames
+from m4.training.utils import VisionEncoderTypes, accelerate_torch_dtype, build_image_transform
 from m4.utils.progress import M4_DISABLE_RICH
 from m4.utils.training.timer import Timer, format_secs_to_time
 
@@ -84,74 +83,12 @@ if __name__ == "__main__":
         logger.info("** Kill switch activated. Exiting the training before it even starts. **")
         sys.exit()
 
-    logger.info(f"** The job is running with the following arguments: **\n{config}\n **** ")
     accelerate.utils.set_seed(config.hparams.seed)
-    # make dir if needed
-    config.hparams.save_dir.mkdir(parents=True, exist_ok=True)
 
-    # When fine_tuning, often the model name does not contain llama/idefics so we try to get this info in the config file if it exists
-    if config.hparams.is_fine_tuning and os.path.exists(f"{config.hparams.model_name}/config.json"):
-        with open(f"{config.hparams.model_name}/config.json", "r") as f:
-            model_config = json.loads(f.read())
-            model_type = model_config["model_type"]
-        config_class, model_class = model_name_to_classes(model_type)
-    else:
-        config_class, model_class = model_name_to_classes(config.hparams.model_name)
+    logger.info(f"** The job is running with the following arguments: **\n{config}\n **** ")
 
-    # we want the target dtype in order to load the model is the most optimal way
-    model_kwargs = dict(torch_dtype=accelerate_torch_dtype())
-    # Case when resuming run. For both pretraining and fine tuning
-    if config.hparams.resume_run:
-        logger.info("Using saved model")
-        vl_model = model_class.from_pretrained(
-            config.resume_param.model_file,
-            config=config.resume_param.model_config_file,
-            is_resume=True,
-            **model_kwargs,
-        )
-        if config.hparams.use_lora:
-            peft_config = PeftConfig.from_pretrained(config.resume_param.lora_file)
-            vl_model.add_adapter(peft_config)
-            vl_model.enable_adapters()
-            logger.info("Resuming training with trained adapter")
-    # Case when starting fine tuning
-    elif config.hparams.is_fine_tuning:
-        # Additionnal vocabulary can be 3 instead of 2 for finetuning to integrate the <end_of_utterance> token
-        # However, if we want to keep training a model from the hub without <end_of_utterance> token. This works as well
-        additional_vocab_size = 39 + len(eval(config.hparams.tokenizer_add_tokens))
-        print(f"additional_vocab_size: {additional_vocab_size}")
-        logger.warning(
-            "This is a fine tuning procedure, so the model parameters are inherited from the base model EXCEPT those"
-            " regarding freezing and additional vocabulary. Finetuning with an additional vocab size of"
-            f" {additional_vocab_size}"
-        )
-        vl_model = model_class.from_pretrained(
-            config.hparams.model_name,
-            is_resume=False,
-            new_model=False,
-            trust_remote_code=True,
-            freeze_lm_head=config.hparams.model_config["freeze_lm_head"],
-            freeze_text_layers=config.hparams.model_config["freeze_text_layers"],
-            freeze_vision_layers=config.hparams.model_config["freeze_vision_layers"],
-            additional_vocab_size=additional_vocab_size,
-            **model_kwargs,
-        )
-        if config.hparams.use_lora and config.hparams.lora_name is not None:
-            vl_model.load_adapter(config.hparams.lora_name)
-            vl_model.enable_adapters()
-            logger.info("Loaded trained adapter")
-    # Standard case for starting a pretraining
-    else:
-        logger.info("Using newly initialized model")
-        additional_special_tokens = eval(config.hparams.tokenizer_params).get("additional_special_tokens", [])
-        vl_config = config_class.from_pretrained(
-            config.hparams.model_name,
-            revision=config.hparams.revision,
-            new_model=True,
-            additional_vocab_size=len(eval(config.hparams.tokenizer_add_tokens)),
-            **config.hparams.model_config,
-        )
-        vl_model = model_class.from_pretrained_models(config.hparams.model_name, config=vl_config, **model_kwargs)
+    # Load model
+    vl_model = config.load_model(torch_dtype=accelerate_torch_dtype())
 
     # If we want to use_lora and are starting a pretraining, or if we want to use a new lora for fine tuning, create the config and add the adapter.
     if (
@@ -190,7 +127,7 @@ if __name__ == "__main__":
     # Get the seq_len for a single image as it is necesssary for packing
     single_image_seq_len = (
         vl_model.config.perceiver_config.resampler_n_latents
-        if vl_model.config.use_resampler
+        if hasattr(vl_model.config, "use_resampler") and vl_model.config.use_resampler
         else int(((vl_model.config.vision_config.image_size // vl_model.config.vision_config.patch_size) ** 2) / (vl_model.config.pixel_shuffle_factor**2))
         # else (vl_model.config.vision_config.image_size // vl_model.config.vision_config.patch_size) ** 2
     )
@@ -200,16 +137,9 @@ if __name__ == "__main__":
         if accelerator.is_main_process:
             time_deltas["model_load"] = timer1.delta()
 
-    tokenizer = get_tokenizer(
-        tokenizer_name=config.hparams.tokenizer_name,
-        tokenizer_add_tokens=config.hparams.tokenizer_add_tokens,
-        tokenizer_add_special_tokens=config.hparams.tokenizer_add_special_tokens,
-        tokenizer_params=config.hparams.tokenizer_params,
-        additional_vocab_size=len(eval(config.hparams.tokenizer_add_tokens)),
-        model_vocab_size=vl_model.config.vocab_size,
-        is_fine_tuning=config.hparams.is_fine_tuning,
-    )
-    tokenizer.pad_token_id = 2
+    # Load tokenizer
+    tokenizer = config.get_tokenizer(model_vocab_size=vl_model.config.vocab_size)
+    # tokenizer.pad_token_id = 2      # TODO: Why is this necessary? Should be handled by the tokenizer itself
 
     if config.hparams.timing_break_down:
         accelerator.wait_for_everyone()

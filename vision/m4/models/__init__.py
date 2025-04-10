@@ -7,6 +7,8 @@ from m4.models.vllama3.configuration_vllama3 import VLlama3Config
 from m4.models.vllama3.modeling_vllama3 import VLlama3ForCausalLM
 from m4.models.vmistral.configuration_vmistral import VMistralConfig
 from m4.models.vmistral.modeling_vmistral import VMistralForCausalLM
+from m4.models.vbert.configuration_vbert import VBertConfig
+from m4.models.vbert.modeling_vbert import VBertForMaskedLM
 
 
 _SUPPORTED_MODELS = {
@@ -15,6 +17,7 @@ _SUPPORTED_MODELS = {
     "idefics": IdeficsConfig,
     "vmistral": VMistralConfig,
     "vllama3": VLlama3Config,
+    "vbert": VBertConfig,
 }
 
 model_type_to_modeling_class = {
@@ -23,4 +26,5 @@ model_type_to_modeling_class = {
     "idefics": IdeficsForCausalLM,
     "vmistral": VMistralForCausalLM,
     "vllama3": VLlama3ForCausalLM,
+    "vbert": VBertForMaskedLM,
 }

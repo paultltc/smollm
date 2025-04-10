@@ -1,6 +1,6 @@
 from m4.evaluation.custom_metrics.perplexity_metrics import MetricsPerplexity
 from m4.models.vgpt2.evaluation_perplexity_in_context_vgpt2 import Vgpt2PerplexityInContext
-from m4.training.types import DatasetTypes
+from m4.training.enums import DatasetTypes
 
 
 class IdeficsPerplexityInContext(Vgpt2PerplexityInContext):
