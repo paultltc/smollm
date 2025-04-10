@@ -320,19 +320,28 @@ class DatasetParams:
     vision_encoder_max_image_size: int = 0
 
     def __post_init__(self):
-        if isinstance(self.training_datasets_paths, str):
-            if self.training_datasets_paths.endswith(".txt") and os.path.exists(self.training_datasets_paths):
-                with open(self.training_datasets_paths, "r") as f:
-                    self.training_datasets_paths = f.read().splitlines()
-            else:
-                self.training_datasets_paths = [self.training_datasets_paths]
+        self.training_datasets_paths = self.parse_paths(self.training_datasets_paths)
+        self.validation_datasets_paths = self.parse_paths(self.validation_datasets_paths)
 
-        if isinstance(self.validation_datasets_paths, str):
-            if self.validation_datasets_paths.endswith(".txt") and os.path.exists(self.validation_datasets_paths):
-                with open(self.validation_datasets_paths, "r") as f:
-                    self.validation_datasets_paths = f.read().splitlines()
+        print(self.training_datasets_paths)
+
+    def parse_paths(paths: str | Path | List[Path]) -> List[Path]:
+        """Parse paths to a list of paths"""
+        if isinstance(paths, str):
+            # check if paths is a directory
+            if os.path.isdir(paths):
+                paths = [file for file in os.listdir(paths) if file.endswith(".tar")]
+            # check if paths is a txt file
+            elif paths.endswith(".txt") and os.path.exists(paths):
+                with open(paths, "r") as f:
+                    paths = f.read().splitlines()
             else:
-                self.validation_datasets_paths = [self.validation_datasets_paths]
+                paths = [paths]
+
+        if isinstance(paths, list):
+            return [Path(path) for path in paths]
+        else:
+            return [Path(paths)]
     
 @dataclass
 class ImageCaptionPairedDatasetParams(DatasetParams):
