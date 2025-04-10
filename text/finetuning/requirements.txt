@@ -1,5 +1,5 @@
 transformers
-trl
+trl>=0.15
 peft
 accelerate
 datasets
