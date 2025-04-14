@@ -409,8 +409,12 @@ class VBertModel(VBertPreTrainedModel):
                 # patch_attention_mask=patch_attention_mask,
             ).last_hidden_state
 
+            print(image_hidden_states)
+
             # Modality projection & resampling
             image_hidden_states = self.connector(image_hidden_states)
+
+            print(image_hidden_states)
 
         elif image_hidden_states is not None:
             image_hidden_states = image_hidden_states.to(dtype=self.dtype, device=input_ids.device)
@@ -543,23 +547,17 @@ class VBertForMaskedLM(VBertPreTrainedModel):
         # Pass the outputs to the MLM head
         hidden_states = outputs[0]
 
-        print(hidden_states )
-
         logits = self.lm_head(hidden_states)
         if self.out_additional_features > 0:
             additional_features = self.additional_fc(hidden_states)
             logits = torch.cat((logits, additional_features), -1)
         logits = logits.float()
 
-        print(logits)
-
         masked_lm_loss = None
         if labels is not None:
             # print the ratio of not ignored tokens
             loss_fct = CrossEntropyLoss()
             masked_lm_loss = loss_fct(logits.view(-1, self.config.vocab_size + self.out_additional_features), labels.view(-1))
-
-        print(masked_lm_loss)
 
         if not return_dict:
             output = (logits,) + outputs[2:]
