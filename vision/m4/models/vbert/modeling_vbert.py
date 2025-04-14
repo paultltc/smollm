@@ -542,6 +542,9 @@ class VBertForMaskedLM(VBertPreTrainedModel):
 
         # Pass the outputs to the MLM head
         hidden_states = outputs[0]
+
+        print(hidden_states )
+
         logits = self.lm_head(hidden_states)
         if self.out_additional_features > 0:
             additional_features = self.additional_fc(hidden_states)
