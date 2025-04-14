@@ -6,12 +6,14 @@ import math
 import random
 from typing import List
 
+import json
+
 import numpy as np
 import torch
 
 import PIL
 
-from m4.training.utils import END_OF_UTTERANCE_TOKEN, FAKE_TOKEN_AROUND_IMAGE_V2, IMAGE_TOKEN, image_splitting
+from m4.training.utils import END_OF_UTTERANCE_TOKEN, FAKE_TOKEN_AROUND_IMAGE_V2, IMAGE_TOKEN, image_splitting, ASSISTANT_TOKEN
 
 
 logger = logging.getLogger(__name__)
@@ -1237,7 +1239,7 @@ def split_pack_and_pad_sft(
     add_begin_of_doc_token=True,
     add_end_of_doc_token=True,
 ):
-    MAX_NUMBER_OF_TURNS = 7
+    MAX_NUMBER_OF_TURNS = 1
     LIST_OF_SFT_DATASETS_WITH_TURNS_ORDER = ["ny_cc_ranking"]
     pad_token_id = tokenizer.pad_token_id
     image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
@@ -1298,22 +1300,22 @@ def split_pack_and_pad_sft(
             assistant_text = t["assistant"].strip()
             if idx == 0:
                 text += (
-                    f"User:{images_text if images_text else ' '}{random_linebreak}{user_text}{END_OF_UTTERANCE_TOKEN}\nAssistant:"
+                    f"User:{images_text if images_text else ' '}{random_linebreak}{user_text}{END_OF_UTTERANCE_TOKEN}{ASSISTANT_TOKEN}"
                     f" {assistant_text}{END_OF_UTTERANCE_TOKEN}\n"
                 )
             else:
                 text += (
-                    f"User: {random_linebreak}{user_text}{END_OF_UTTERANCE_TOKEN}\nAssistant:"
+                    f"User: {random_linebreak}{user_text}{END_OF_UTTERANCE_TOKEN}{ASSISTANT_TOKEN}"
                     f" {assistant_text}{END_OF_UTTERANCE_TOKEN}\n"
                 )
         # Remove trailing and leading whitespaces, including newlines and tabs
         text = text.strip("\n")
-
+        
         sample_input_ids = tokenizer.encode(text, add_special_tokens=False)
-        if add_end_of_doc_token:
+        if add_end_of_doc_token and not sample_input_ids[-1] == tokenizer.eos_token_id:
             sample_input_ids += [tokenizer.eos_token_id]
 
-        if add_begin_of_doc_token:
+        if add_begin_of_doc_token and not sample_input_ids[0] == tokenizer.bos_token_id:
             sample_input_ids = [tokenizer.bos_token_id] + sample_input_ids
 
         if len(sample_input_ids) > max_seq_len:

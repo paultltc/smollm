@@ -220,13 +220,12 @@ class VBertModel(VBertPreTrainedModel):
         
         # if config.text_config._attn_implementation == "flash_attention_2":
         language_model_config._attn_implementation = config._attn_implementation
-        torch_dtype = torch.bfloat16 if config._attn_implementation == "flash_attention_2"\
-                        else None
+        torch_dtype = torch.bfloat16 if config._attn_implementation == "flash_attention_2" else None
 
         model = AutoModel.from_config(language_model_config, trust_remote_code=True, torch_dtype=torch_dtype)
         # extractor = regex_lookup(language_model_name, language_model_name2model)
 
-        embed_tokens = DecoupledEmbedding(
+        embed_layer = DecoupledEmbedding(
             num_embeddings=config.vocab_size,
             num_additional_embeddings=config.additional_vocab_size,
             embedding_dim=config.hidden_size,
@@ -234,7 +233,7 @@ class VBertModel(VBertPreTrainedModel):
             padding_idx=config.pad_token_id,
         )
 
-        model.set_input_embeddings(embed_tokens)
+        model.set_input_embeddings(embed_layer)
 
         return model
 

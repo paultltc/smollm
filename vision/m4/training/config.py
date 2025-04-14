@@ -320,17 +320,17 @@ class DatasetParams:
     vision_encoder_max_image_size: int = 0
 
     def __post_init__(self):
+        # Parse paths
         self.training_datasets_paths = self.parse_paths(self.training_datasets_paths)
         self.validation_datasets_paths = self.parse_paths(self.validation_datasets_paths)
 
-        print(self.training_datasets_paths)
-
+    @staticmethod
     def parse_paths(paths: str | Path | List[Path]) -> List[Path]:
         """Parse paths to a list of paths"""
         if isinstance(paths, str):
             # check if paths is a directory
             if os.path.isdir(paths):
-                paths = [file for file in os.listdir(paths) if file.endswith(".tar")]
+                paths = [f"file://{os.path.normpath(paths)}/{file}" for file in os.listdir(paths) if file.endswith(".tar")]
             # check if paths is a txt file
             elif paths.endswith(".txt") and os.path.exists(paths):
                 with open(paths, "r") as f:
@@ -338,11 +338,9 @@ class DatasetParams:
             else:
                 paths = [paths]
 
-        if isinstance(paths, list):
-            return [Path(path) for path in paths]
-        else:
-            return [Path(paths)]
-    
+        return paths
+        return [Path(path) for path in paths]
+
 @dataclass
 class ImageCaptionPairedDatasetParams(DatasetParams):
     dataset_type: DatasetTypes = DatasetTypes.IMAGE_CAPTION_PAIRS
@@ -758,6 +756,7 @@ class Parameters(Serializable):
                 revision=self.hparams.revision,
                 new_model=True,
                 additional_vocab_size=len(eval(self.hparams.tokenizer_add_tokens)),
+                torch_dtype=torch_dtype,
                 **self.hparams.model_config,
             )
             vl_model = model_class.from_pretrained_models(self.hparams.model_name, config=vl_config, **model_kwargs)

@@ -34,6 +34,7 @@ from m4.utils.check_valid_tokenizer import check_valid_tokenizer
 IMAGE_TOKEN = "<image>"
 FAKE_TOKEN_AROUND_IMAGE_V2 = "<fake_token_around_image>"
 FAKE_TOKEN_AROUND_IMAGE_V1 = "\n\n"
+ASSISTANT_TOKEN = "\nAssistant:"
 END_OF_UTTERANCE_TOKEN = "<end_of_utterance>"
 # Originally taken from the values used in OpenCLIP
 IMAGE_DATASET_MEAN = (0.48145466, 0.4578275, 0.40821073)

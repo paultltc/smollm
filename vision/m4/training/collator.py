@@ -1,3 +1,5 @@
+import torch
+
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 from dataclasses import dataclass
 
@@ -11,6 +13,8 @@ from random import randint
 from typing import Any, Callable, Dict, List, NewType, Optional, Tuple, Union
 
 import numpy as np
+
+from m4.training.utils import END_OF_UTTERANCE_TOKEN, ASSISTANT_TOKEN, IMAGE_TOKEN
 
 import logging
 logger = logging.getLogger(__name__)
@@ -60,16 +64,36 @@ class SimpleDataCollatorForVisionLanguage(DataCollatorMixin):
     def __post_init__(self):
         if self.tokenizer is None and hasattr(self.processor, "tokenizer"):
             self.tokenizer = self.processor.tokenizer
-        else:
+
+        if self.tokenizer is None:
             raise ValueError(
-                "You need to specify a tokenizer to use `DataCollatorForVisionLanguage` collators."
+                "You need to specify a tokenizer or pass it through the processor to use `DataCollatorForVisionLanguage` collators."
             )
 
     @property
     def image_token_id(self) -> int:
         return self.tokenizer.additional_special_tokens_ids[
-            self.tokenizer.additional_special_tokens.index("<image>")
+            self.tokenizer.additional_special_tokens.index(IMAGE_TOKEN)
         ]
+
+    @property
+    def eou_token_id(self) -> int:
+        return self.tokenizer.additional_special_tokens_ids[
+            self.tokenizer.additional_special_tokens.index(END_OF_UTTERANCE_TOKEN)
+        ]
+
+    @property
+    def bos_token_id(self) -> int:
+        return self.tokenizer.bos_token_id
+
+    @property
+    def eos_token_id(self) -> int:
+        return self.tokenizer.eos_token_id
+    
+    @property
+    def assistant_token_ids(self) -> List[int]:
+        return self.tokenizer(ASSISTANT_TOKEN, add_special_tokens=False)["input_ids"]
+        return self.tokenizer.convert_tokens_to_ids(ASSISTANT_TOKEN)
 
     def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
         # if isinstance(examples[0], Mapping):
@@ -79,18 +103,89 @@ class SimpleDataCollatorForVisionLanguage(DataCollatorMixin):
         batch = self.processor(examples)
 
         # If special token mask has been preprocessed, pop it from the dict.
-        special_tokens_mask = batch.pop("special_tokens_mask", None)
-
-        # If special token mask has been preprocessed, pop it from the dict.
         batch["input_ids"], batch["labels"] = self.torch_mask_tokens(
-            batch["input_ids"], special_tokens_mask=special_tokens_mask
+            batch["input_ids"], special_tokens_mask=batch.pop("special_tokens_mask", None)
         )
 
         return batch
     
-    def torch_mask_tokens(self, inputs: Any, special_tokens_mask: Optional[Any] = None, **kwargs) -> Tuple[Any, Any]:
+    def torch_mask_tokens(
+            self, 
+            inputs: Any, 
+            special_tokens_mask: Optional[Any] = None, 
+            do_image_masking: bool = False,
+            do_query_masking: bool = False,
+            **kwargs
+        ) -> Tuple[Any, Any]:
         # This is a dummy method that should be implemented in the subclasses
+        labels = inputs.clone()
+
+        if not do_image_masking:
+            # Set the image tokens to 0.0 probability if we don't want to mask them
+            images_mask = labels == self.image_token_id
+            labels[images_mask] = -100  # We only compute loss on masked tokens
+
+        if not do_query_masking:
+            query_mask = ~self._sft_completion_mask(labels)
+            labels[query_mask] = -100
+
         return inputs, inputs.clone()
+
+    def _sft_completion_mask(
+            self, 
+            labels: torch.Tensor,
+        ):
+        """
+        Create a mask for the completion part of the input sequence.
+        The mask is a boolean tensor where True indicates the positions to be masked.
+        """
+        batch_labels = labels.tolist()
+
+        mask = torch.zeros_like(labels, dtype=torch.long)
+
+        # Print SFT tokens
+        # print("SFT tokens:")
+        # print("BOS:", self.bos_token_id)
+        # print("EOS:", self.eos_token_id)
+        # print("EOU:", self.eou_token_id)
+        # print("ASSISTANT:", self.assistant_token_ids)
+
+        for i, labels_ in enumerate(batch_labels):
+            starts_ends_list = []
+            start, end = None, None
+            counter_eou = 0
+
+            for idx, l_ in enumerate(labels_):
+                if l_ == self.bos_token_id:
+                    assert start is None and end is None, (idx, start, end)
+                    # print("Start of sequence:", idx)
+                elif l_ == self.eou_token_id:
+                    # print("End of utterance:", idx)
+                    counter_eou += 1
+                    if counter_eou % 2 == 0:
+                        # print(" > End of assistant.")
+                        assert start is not None and end is None, (idx, start, end)
+                        # Check if the next token is the assistant token
+                        expected_assistant = torch.tensor(labels_[start : start + len(self.assistant_token_ids)])
+                        assitant_toks = torch.tensor(self.assistant_token_ids)
+                        assert torch.all(expected_assistant == assitant_toks), (idx, expected_assistant, assitant_toks)
+                        end = idx - 1 
+                        starts_ends_list.append((start, end))
+                        start, end = None, None
+                    else:   
+                        # print(" > End of user.")
+                        assert start is None and end is None, (idx, start, end)
+                        if idx + 1 < len(labels_) and labels_[idx + 1] != self.eos_token_id:
+                            start = idx + 1
+                elif l_ == self.eos_token_id:
+                    # print("End of sequence:", idx)
+                    assert start is None and end is None, (idx, start, end)
+            assert start is None and end is None, (idx, start, end)
+
+            for start_index, end_index in starts_ends_list:
+                mask[i, start_index:end_index] = 1
+
+        return mask.bool()
 
 
 @dataclass
@@ -152,11 +247,12 @@ class DataCollatorForVisionLanguageModeling(SimpleDataCollatorForVisionLanguage)
 
     </Tip>
     """
-
+    # mlm args
     mlm: bool = True
     mlm_probability: float = 0.5
     mask_replace_prob: float = 0.8
     random_replace_prob: float = 0.1
+    # common args
     pad_to_multiple_of: Optional[int] = None
     tf_experimental_compile: bool = False
     return_tensors: str = "pt"
@@ -176,12 +272,13 @@ class DataCollatorForVisionLanguageModeling(SimpleDataCollatorForVisionLanguage)
             raise ValueError("mask_replace_prob should be between 0 and 1.")
         if self.random_replace_prob < 0 or self.random_replace_prob > 1:
             raise ValueError("random_replace_prob should be between 0 and 1.")
-    
+
     def torch_mask_tokens(
             self, 
             inputs: Any, 
             special_tokens_mask: Optional[Any] = None,
-            mask_images: bool = False,
+            mask_images_tokens: bool = False,
+            mask_completion_tokens_only: bool = False
         ) -> Tuple[Any, Any]:
         """
         Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original.
@@ -203,9 +300,14 @@ class DataCollatorForVisionLanguageModeling(SimpleDataCollatorForVisionLanguage)
         probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
 
         # Set the image tokens to 0.0 probability if we don't want to mask them
-        if not mask_images:
+        if not mask_images_tokens:
             images_mask = labels == self.image_token_id
             probability_matrix.masked_fill_(images_mask, value=0.0)
+
+        # if it is sft type, set the query tokens to 0.0 probability
+        # if not mask_completion_tokens_only:
+        #     completion_mask = self._sft_completion_mask(labels)
+        #     probability_matrix.masked_fill_(~completion_mask, value=0.0)
 
         masked_indices = torch.bernoulli(probability_matrix).bool()
         labels[~masked_indices] = -100  # We only compute loss on masked tokens

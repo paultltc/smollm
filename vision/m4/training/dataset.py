@@ -19,7 +19,7 @@ from PIL import Image, ImageFile
 from torch.utils.data import Sampler
 
 from m4.training.config import DataParams, DatasetParams, Parameters
-from m4.training.dataset_utils import check_webdataset_command, get_webdataset, paths_to_wds_commands
+from m4.training.dataset_utils import check_webdataset_command, get_webdataset, preprocess_webdataset_sample
 from m4.training.packing import (
     split_pack_and_pad_iqa_finetuning,
     split_pack_and_pad_ocr,
@@ -104,6 +104,15 @@ collators_map = {
     MaskingTypes.SFT: DataCollatorForVisionLanguageSFT,
 }
 
+split_fn_map = {
+    DatasetTypes.IMAGE_CAPTION_PAIRS: split_pack_and_pad_pairs,
+    DatasetTypes.OCR: split_pack_and_pad_ocr,
+    DatasetTypes.VQAV2_TASK_FINETUNING: split_pack_and_pad_iqa_finetuning,
+    DatasetTypes.DOCVQA: split_pack_and_pad_iqa_finetuning,
+    DatasetTypes.SFT: split_pack_and_pad_sft,
+    DatasetTypes.WEB_DOCUMENTS: split_pack_and_pad_webdocs,
+}
+
 def get_mapper(
     tokenizer,
     image_transform,
@@ -115,6 +124,7 @@ def get_mapper(
     vision_encoder_max_image_size: int = 384,
     pre_split_scale_up_max=1.0,
     pre_split_scale_up_frequency=0.0,
+    is_webdataset: bool = False,
     is_t5: bool = False,
     pad_dataset: bool = True,
     max_num_samples_per_document: int = 1,
@@ -140,25 +150,23 @@ def get_mapper(
 
     if not pad_dataset:
         raise ValueError("This feature has been deprecated. The dataset must be padded")
+    
+    split_fn = split_fn_map[dataset_type]
 
     if is_t5:
         mapper_kwargs["noise_density"] = t5_mlm_noise_density
         mapper_kwargs["mean_noise_span_length"] = t5_mlm_mean_noise_span_length
         raise ValueError("This feature has been deprecated. We can't pack for t5")
-    elif dataset_type == DatasetTypes.IMAGE_CAPTION_PAIRS:
-        split_fn = split_pack_and_pad_pairs
-    elif dataset_type == DatasetTypes.OCR:
-        split_fn = split_pack_and_pad_ocr
-    elif (dataset_type == DatasetTypes.VQAV2_TASK_FINETUNING) or (dataset_type == DatasetTypes.DOCVQA):
-        split_fn = split_pack_and_pad_iqa_finetuning
-    elif dataset_type == DatasetTypes.SFT:
-        split_fn = split_pack_and_pad_sft
-    elif dataset_type == DatasetTypes.WEB_DOCUMENTS:
-        split_fn = split_pack_and_pad_webdocs
+
+    if dataset_type == DatasetTypes.WEB_DOCUMENTS:
         mapper_kwargs["max_num_samples_per_document"] = max_num_samples_per_document
         mapper_kwargs["max_num_images_per_document"] = max_num_images_per_document
 
     mapper_with_args = partial(split_fn, **mapper_kwargs)
+
+    # if is webdataset, add the proc_webdataset function before feeding to mapper_with_args
+    # if is_webdataset:
+    #     return lambda sample: mapper_with_args(preprocess_webdataset_sample(sample, **mapper_kwargs))
 
     return mapper_with_args
 
@@ -287,6 +295,7 @@ def get_dataset_hf(
                 pre_split_scale_up_max=dataset_config.pre_split_scale_up_max,
                 pre_split_scale_up_frequency=dataset_config.pre_split_scale_up_frequency,
                 dataset_type=DatasetTypes.IMAGE_CAPTION_PAIRS if is_paired_dataset else DatasetTypes.WEB_DOCUMENTS,
+                is_webdataset=False,
                 is_t5=is_t5,
                 **optional_kwargs,
             )
@@ -376,6 +385,7 @@ def get_dataloader(
     is_train=True,
     persistent_workers=True,
     realtime_processing=False,
+    is_webdataset: bool = False,
     # The following arguments only used for iterable dataset
     rank=None,
     world_size=None,
@@ -481,6 +491,7 @@ def get_dataloader(
                 tokenizer=tokenizer,
                 image_transform=image_transforms[dataset_name.name.lower()],
                 image_seq_len=image_seq_len,
+                is_webdataset=is_webdataset,
                 **dataset_kwargs,
             )  
             # COLLATOR
@@ -547,6 +558,7 @@ def get_dataloader_from_config(
         pin_memory=config.data_param.pin_memory,
         batch_size=config.data_param.batch_size,
         is_train=is_train,
+        is_webdataset=config.data_param.use_webdataset,
         persistent_workers=config.data_param.persistent_workers,
         realtime_processing=config.data_param.realtime_processing,
         rank=rank,

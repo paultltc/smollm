@@ -5,6 +5,7 @@ import io
 import json
 import logging
 import random
+import math
 
 import os
 
@@ -507,3 +508,167 @@ def get_webdataset(
         )
     else:
         raise ValueError(f"Unknown dataset type: {ds_type}")
+
+IMAGE_TOKEN = "<image>"
+FAKE_TOKEN_AROUND_IMAGE_V2 = "<fake_token_around_image>"
+FAKE_TOKEN_AROUND_IMAGE_V1 = "\n\n"
+END_OF_UTTERANCE_TOKEN = "<end_of_utterance>"
+
+def preprocess_webdataset_sample(
+    sample,
+    tokenizer,
+    max_seq_len,
+    image_transform,
+    max_num_images,
+    image_seq_len,
+    max_image_size=384,
+    vision_encoder_max_image_size=384,
+    pre_split_scale_up_max=1.0,
+    pre_split_scale_up_frequency=0.0,
+    max_num_samples_per_document=10,
+    prefix_seed=(0, 0),
+    add_begin_of_doc_token=True,
+    add_end_of_doc_token=True,
+    max_num_images_per_document=None,
+    skip_ending_two_images=True,
+    skip_multiple_consecutive_images=True,
+):
+    """
+    Return a batch of samples in the format expected by the model which
+    includes `input_ids`, `pixel_values`, `attention_mask`, `image_attention_mask`,
+    and `next_image_attention_mask`. The `input_ids` are sampled from the document to
+    ensure it has `max_seq_len` tokens otherwise, the shorter documents are packed together.
+    For each document, we sample a maximum of `max_num_samples_per_document` or `max_num_samples_for_curr_document`
+    (where the latter is proportional to the length of the document and inversely proportional to the length of subsequences)
+    `input_ids` with sequence length `max_seq_len` from the document. This means that
+    each sample sampled can have different start index. Based on the start index of sample that
+    has been sampled, we also sample a maximum of `max_num_images` images from the document.
+    If there are less than `max_num_images` images in the document, we pad the images with zeros.
+    The start indexes are skewed towards subsequences that contain images.
+
+    Args:
+        sample (Dict): A sample object containing the document with images and text.
+        tokenizer (PretrainedTokenizer): Text tokenizer to be used.
+        max_seq_len (int): Maximum sequence length of the returned text tokens.
+        image_transform (Callable): Transform to be applied on the images
+        max_num_images (int): Maximum number of images to be sampled per sample. If less, they are padded with zeros.
+        max_num_samples_per_document (int, optional): Maximum number of samples per document to be sampled. Defaults to 10.
+        prefix_seed: Prefix seed sequence for "reproducible randomness" in calls to `np.random.choice`
+
+    Returns:
+        _type_: _description_
+    """
+    text_batch = sample["texts"]
+    image_batch = sample.get("images", None)
+    if image_batch is None:
+        raise ValueError("`images` must be present in the sample")
+
+    pad_token_id = tokenizer.pad_token_id
+
+    image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
+    last_was_image = False
+
+    fake_token_around_image_id = tokenizer.convert_tokens_to_ids(FAKE_TOKEN_AROUND_IMAGE_V2)
+    MAX_NUM_IMAGE_ROWS_AND_COLUMNS = math.ceil(max_image_size / vision_encoder_max_image_size)
+    MAX_NUM_IMAGES_AFTER_SPLIT = (
+        MAX_NUM_IMAGE_ROWS_AND_COLUMNS**2 + 1 * (MAX_NUM_IMAGE_ROWS_AND_COLUMNS != 1)
+    ) * max_num_images
+
+    # We need to encode the \n\n with another token that we remove afterwards to prevent the tokenizer from generating
+    # the prefix token.
+    double_breaking_lines_token_ids = tokenizer.encode("_\n\n", add_special_tokens=False)
+    double_breaking_lines_token_ids = [
+        tok for tok in double_breaking_lines_token_ids if tok not in tokenizer.encode("_", add_special_tokens=False)
+    ]
+
+    all_images = []
+    all_texts = []
+    for raw_images, raw_texts in zip(image_batch, text_batch):
+        # Filter ones that don't have either one image and one text word
+        if not any(raw_images) or not any(raw_texts):
+            continue
+
+        if max_num_images_per_document:
+            num_images = sum([1 if image is not None else 0 for image in raw_images])
+            if num_images > max_num_images_per_document:
+                continue
+
+        if skip_ending_two_images:
+            # Skipping sequences that end with a concatenation of at least two images with no text in between
+            # Order of magnitude: skipping 10% of sequences
+            if (len(raw_texts) >= 2) and (raw_texts[-1] is None) and (raw_texts[-2] is None):
+                continue
+
+        def has_consecutive_nones(lst, max_num_nones=3):
+            count = 0
+            for item in lst:
+                if item is None:
+                    count += 1
+                    if count == max_num_nones:
+                        return True
+                else:
+                    count = 0
+            return False
+
+        if skip_multiple_consecutive_images and has_consecutive_nones(raw_texts):
+            # We skip documents with at least 3 consecutive images
+            continue
+
+        # inds_of_texts_to_split = [
+        #     i
+        #     for i, text in enumerate(raw_texts)
+        #     if text is not None and isinstance(text, str) and "END_OF_DOCUMENT_TOKEN_TO_BE_REPLACED" in text
+        # ]
+        # if inds_of_texts_to_split:
+        #     splitted_raw_images, splitted_raw_texts = [], []
+        #     previous_i = 0
+        #     for i in inds_of_texts_to_split:
+        #         splitting = raw_texts[i].split("END_OF_DOCUMENT_TOKEN_TO_BE_REPLACED")
+        #         part1, part2 = splitting[0], splitting[-1]
+
+        #         sub_doc_images = raw_images[previous_i:i] + [None]
+        #         sub_doc_texts = raw_texts[previous_i:i] + [part1.strip()]
+        #         if not any(sub_doc_images):  # This can happen if all images in raw_images[0:i] are all None
+        #             continue
+
+        #         splitted_raw_images.append(sub_doc_images)
+        #         splitted_raw_texts.append(sub_doc_texts)
+
+        #         if part2.strip() == "":
+        #             previous_i = i + 1
+        #         else:
+        #             raw_texts[i] = part2.strip()
+        #             previous_i = i
+
+        #     if previous_i < len(raw_images) and any(raw_images[previous_i:]):
+        #         splitted_raw_images.append(raw_images[previous_i:])
+        #         splitted_raw_texts.append(raw_texts[previous_i:])
+
+        # else:
+        #     splitted_raw_images, splitted_raw_texts = [raw_images], [raw_texts]
+
+        # # Sanity check
+        # if [len(ims) for ims in splitted_raw_images] != [len(txts) for txts in splitted_raw_texts]:
+        #     raise ValueError(
+        #         "Number of images and texts don't match after splitting on `END_OF_DOCUMENT_TOKEN_TO_BE_REPLACED`."
+        #         " Something core went wrong during the splitting and needs to be fixed."
+        #     )
+        for s_r_ims, s_r_txts in zip(raw_images, raw_texts):
+            images, texts = [], []
+            for image, text in zip(s_r_ims, s_r_txts):
+                if text is None and image is None:
+                    continue
+                if (text is not None) and ((FAKE_TOKEN_AROUND_IMAGE_V2 in text) or (IMAGE_TOKEN in text)):
+                    continue
+                if image is not None:
+                    images.append(image)
+                if text is not None:
+                    texts.append(text)
+
+            all_images.append(images)
+            all_texts.append(texts)
+
+    return {
+        "images": all_images,
+        "texts": all_texts
+    }
