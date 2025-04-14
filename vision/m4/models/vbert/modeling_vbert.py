@@ -548,11 +548,15 @@ class VBertForMaskedLM(VBertPreTrainedModel):
             logits = torch.cat((logits, additional_features), -1)
         logits = logits.float()
 
+        print(logits)
+
         masked_lm_loss = None
         if labels is not None:
             # print the ratio of not ignored tokens
             loss_fct = CrossEntropyLoss()
             masked_lm_loss = loss_fct(logits.view(-1, self.config.vocab_size + self.out_additional_features), labels.view(-1))
+
+        print(masked_lm_loss)
 
         if not return_dict:
             output = (logits,) + outputs[2:]
