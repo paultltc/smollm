@@ -93,7 +93,6 @@ class SimpleDataCollatorForVisionLanguage(DataCollatorMixin):
     @property
     def assistant_token_ids(self) -> List[int]:
         return self.tokenizer(ASSISTANT_TOKEN, add_special_tokens=False)["input_ids"]
-        return self.tokenizer.convert_tokens_to_ids(ASSISTANT_TOKEN)
 
     def torch_call(self, examples: List[Union[List[int], Any, Dict[str, Any]]]) -> Dict[str, Any]:
         # if isinstance(examples[0], Mapping):
@@ -305,9 +304,9 @@ class DataCollatorForVisionLanguageModeling(SimpleDataCollatorForVisionLanguage)
             probability_matrix.masked_fill_(images_mask, value=0.0)
 
         # if it is sft type, set the query tokens to 0.0 probability
-        # if not mask_completion_tokens_only:
-        #     completion_mask = self._sft_completion_mask(labels)
-        #     probability_matrix.masked_fill_(~completion_mask, value=0.0)
+        if not mask_completion_tokens_only:
+            completion_mask = self._sft_completion_mask(labels)
+            probability_matrix.masked_fill_(~completion_mask, value=0.0)
 
         masked_indices = torch.bernoulli(probability_matrix).bool()
         labels[~masked_indices] = -100  # We only compute loss on masked tokens

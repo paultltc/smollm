@@ -1254,8 +1254,6 @@ def split_pack_and_pad_sft(
     double_breaking_lines_token_ids = [
         tok for tok in double_breaking_lines_token_ids if tok not in tokenizer.encode("_", add_special_tokens=False)
     ]
-    end_of_utterance_token_id = tokenizer.convert_tokens_to_ids(END_OF_UTTERANCE_TOKEN)
-    assistant_token_ids = tokenizer("\nAssistant:", add_special_tokens=False)["input_ids"]
 
     text_batch = sample["texts"]
     image_batch = sample.get("images", None)
