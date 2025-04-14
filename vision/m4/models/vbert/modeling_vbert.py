@@ -409,12 +409,8 @@ class VBertModel(VBertPreTrainedModel):
                 # patch_attention_mask=patch_attention_mask,
             ).last_hidden_state
 
-            print(image_hidden_states)
-
             # Modality projection & resampling
             image_hidden_states = self.connector(image_hidden_states)
-
-            print(image_hidden_states)
 
         elif image_hidden_states is not None:
             image_hidden_states = image_hidden_states.to(dtype=self.dtype, device=input_ids.device)
