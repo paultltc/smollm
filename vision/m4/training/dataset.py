@@ -1035,7 +1035,7 @@ class IterableWrapperWebdataset(torch.utils.data.IterableDataset):
 
                         start = 0
                         for batch in [overflow_batch, curr_mapped_batch]:
-                            if "pixel_values" not in batch:
+                            if not self._batch_has_images(batch):
                                 continue
                             px = batch["pixel_values"]
                             px_attn_mask = batch["pixel_attention_mask"]

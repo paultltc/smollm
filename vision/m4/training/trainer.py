@@ -605,8 +605,16 @@ Batch sizes:
             eval_is_done,
             gbs_running,
         )
+    
+    @property
+    def _is_deepspeed_enabled(self):
+        return hasattr(self.accelerator, "deepspeed_engine_wrapped")
+    
+    @property
+    def _sync_gradients(self):
+        return self.accelerator.sync_gradients
 
-    def _do_batch(self, batch, curr_opt_step, dataset_name=None, dataset_idx=None, validation=False):
+    def _compute_batch_stats(self, batch):
         # Use effective max_num_images per batch. ie: if the max_num_images of this batch is 3, the pixel_values and image mask are truncated accordingly.
         # Same for max_height and max_width
         effective_max_num_images = max(batch["num_images"])
@@ -645,6 +653,84 @@ Batch sizes:
             pixel_values_sum = torch.tensor(0.0, device=self.accelerator.device)
         image_to_text_ratio = torch.div(num_images, num_text_tokens)
 
+        return (
+            effective_max_num_images,
+            effective_max_num_tokens,
+            num_images,
+            num_image_tokens,
+            num_text_tokens,
+            total_tokens,
+            num_padding,
+            pixel_values_sum,
+            image_to_text_ratio,
+        )
+    
+    def _compute_losses(self, outputs, batch, dataset_idx):
+        per_token_loss = outputs.loss
+
+        if self.hparams.loss_weights_per_dataset is not None:
+            per_token_loss *= self.hparams.loss_weights_per_dataset[dataset_idx]
+        if self.optim_param.z_loss > 0.0:
+            logits = outputs.logits
+            attention_mask = batch["attention_mask"] * (batch["input_ids"] != self.image_token_id).long()
+            log_z = torch.logsumexp(logits, dim=-1) * attention_mask
+            z_loss = log_z**2
+            z_loss = z_loss.sum() / attention_mask.sum()
+            combined_loss = per_token_loss + self.optim_param.z_loss * z_loss
+        else:
+            z_loss = torch.tensor(0.0, device=self.accelerator.device)
+            combined_loss = per_token_loss
+
+        return per_token_loss, z_loss, combined_loss
+    
+    def _opt_step(self, step):
+        if self._sync_gradients:
+            self.accelerator.clip_grad_norm_(self.vl_model.parameters(), self.hparams.grad_clip)
+
+            if (
+                len(self.hparams.train_logging_grad_param_deepspeed) != 0
+                and (step + 1) % self.hparams.train_logging_grad_param_deepspeed_opt_steps == 0
+            ):
+                self._log_deepspeed_training_stats(curr_opt_step=step)
+
+        if self._is_deepspeed_enabled:
+            self.accelerator.deepspeed_engine_wrapped.engine.step()
+
+        self.vl_optim.step()
+
+        # 1. sync_gradients is used for this dirty trick: https://github.com/huggingface/m4/pull/386
+        # 2. since we don't accelerate prepare the lr scheduler we need to manually skip it if
+        # optimizer skipped (otherwise accelerate would do that for us)
+        if self._sync_gradients and not self.accelerator.optimizer_step_was_skipped:
+            self.vl_scheduler.step()
+
+        self.vl_optim.zero_grad(set_to_none=True)
+
+    def _bwd_pass(self, loss):
+        # accelerate's deepspeed `backward` calls `engine.step`, which is a problem if we want
+        # to investigate things before step, so override with just a backward call and then call
+        # `engine.step` along with `optim.step` a bit lower
+        if self._is_deepspeed_enabled:
+            self.accelerator.deepspeed_engine_wrapped.engine.backward(loss)
+        else:
+            self.accelerator.backward(loss)
+
+    def _do_batch(self, batch, curr_opt_step, dataset_name=None, dataset_idx=None, validation=False):
+        # Get batch stats
+        (
+            effective_max_num_images,
+            effective_max_num_tokens,
+            num_images,
+            num_image_tokens,
+            num_text_tokens,
+            total_tokens,
+            num_padding,
+            pixel_values_sum,
+            image_to_text_ratio,
+        ) = self._compute_batch_stats(batch)
+
+
+        # Forward pass
         vl_output = self.vl_model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
@@ -652,69 +738,34 @@ Batch sizes:
             pixel_attention_mask=batch["pixel_attention_mask"] if "pixel_attention_mask" in batch else None,
             labels=batch["labels"] if "labels" in batch else batch["input_ids"],
         )
-        per_token_loss = vl_output.loss
 
         if validation:
             return (
-                per_token_loss,
+                vl_output.loss,
                 num_images,
                 num_text_tokens,
                 image_to_text_ratio,
                 num_padding,
                 pixel_values_sum,
             )
-        else:
-            if self.hparams.loss_weights_per_dataset is not None:
-                per_token_loss *= self.hparams.loss_weights_per_dataset[dataset_idx]
-            if self.optim_param.z_loss > 0.0:
-                logits = vl_output.logits
-                attention_mask = batch["attention_mask"] * (1 - (batch["input_ids"] == self.image_token_id).long())
-                log_z = torch.logsumexp(logits, dim=-1) * attention_mask
-                z_loss = log_z**2
-                z_loss = z_loss.sum() / attention_mask.sum()
-                combined_loss = per_token_loss + self.optim_param.z_loss * z_loss
-            else:
-                z_loss = torch.tensor(0.0, device=self.accelerator.device)
-                combined_loss = per_token_loss
-            sync_gradients = self.accelerator.sync_gradients
-            deepspeed = hasattr(self.accelerator, "deepspeed_engine_wrapped")
+        
+        # Compute loss
+        (
+            per_token_loss, 
+            z_loss, 
+            combined_loss
+        ) = self._compute_losses(vl_output, batch, dataset_idx)
 
-            # accelerate's deepspeed `backward` calls `engine.step`, which is a problem if we want
-            # to investigate things before step, so override with just a backward call and then call
-            # `engine.step` along with `optim.step` a bit lower
-            if deepspeed:
-                self.accelerator.deepspeed_engine_wrapped.engine.backward(combined_loss)
-            else:
-                self.accelerator.backward(combined_loss)
+        self._bwd_pass(loss=combined_loss)
+        self._opt_step(step=curr_opt_step)
 
-            if sync_gradients:
-                self.accelerator.clip_grad_norm_(self.vl_model.parameters(), self.hparams.grad_clip)
-
-                if (
-                    len(self.hparams.train_logging_grad_param_deepspeed) != 0
-                    and (curr_opt_step + 1) % self.hparams.train_logging_grad_param_deepspeed_opt_steps == 0
-                ):
-                    self._log_deepspeed_training_stats(curr_opt_step=curr_opt_step)
-
-            if deepspeed:
-                self.accelerator.deepspeed_engine_wrapped.engine.step()
-
-            self.vl_optim.step()
-
-            # 1. sync_gradients is used for this dirty trick: https://github.com/huggingface/m4/pull/386
-            # 2. since we don't accelerate prepare the lr scheduler we need to manually skip it if
-            # optimizer skipped (otherwise accelerate would do that for us)
-            if sync_gradients and not self.accelerator.optimizer_step_was_skipped:
-                self.vl_scheduler.step()
-
-            self.vl_optim.zero_grad(set_to_none=True)
-            tflops_per_batch_per_gpu = self.vl_model.get_model_tflops_per_batch_per_gpu(
-                hparams=self.hparams,
-                data_param=getattr(self.data_param, dataset_name),
-                tokenizer=self.tokenizer,
-                max_num_images=effective_max_num_images,
-                max_num_tokens=effective_max_num_tokens,
-            ).to(self.accelerator.device)
+        tflops_per_batch_per_gpu = self.vl_model.get_model_tflops_per_batch_per_gpu(
+            hparams=self.hparams,
+            data_param=getattr(self.data_param, dataset_name),
+            tokenizer=self.tokenizer,
+            max_num_images=effective_max_num_images,
+            max_num_tokens=effective_max_num_tokens,
+        ).to(self.accelerator.device)
 
         # Reset batch
         return (
