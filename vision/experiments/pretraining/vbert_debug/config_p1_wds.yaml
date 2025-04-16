@@ -69,7 +69,7 @@ hparams:
         qk_layer_norms: False
         use_cache: True
         neftune_noise_alpha: 0.0
-        image_token_id: 128294
+        image_token_id: 128295
     lora_config:
         lora_alpha: 16
         lora_dropout: 0.1
