@@ -685,8 +685,7 @@ Batch sizes:
             if deepspeed:
                 self.accelerator.deepspeed_engine_wrapped.engine.backward(combined_loss)
             else:
-                with torch.autograd.detect_anomaly():
-                    self.accelerator.backward(combined_loss)
+                self.accelerator.backward(combined_loss)
 
             if sync_gradients:
                 self.accelerator.clip_grad_norm_(self.vl_model.parameters(), self.hparams.grad_clip)
