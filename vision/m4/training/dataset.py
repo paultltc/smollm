@@ -953,6 +953,12 @@ class IterableWrapperWebdataset(torch.utils.data.IterableDataset):
         #   => It will look something like 0, 2, 4 when worker_id is 0 and num_workers is 2
         worker_indices = indices[worker_id::worker_total_num]
         return worker_indices, worker_id
+    
+    def _batch_has_images(self, batch):
+        if "pixel_values" in batch and batch["pixel_values"].ndim == 5:
+            return True
+        else:
+            return False
 
     def __iter__(self):
         # Dummy dataset idx used for compatibility with CustomChainDataset
@@ -1011,16 +1017,16 @@ class IterableWrapperWebdataset(torch.utils.data.IterableDataset):
                     if "pixel_values" in overflow_batch or "pixel_values" in curr_mapped_batch:
                         total_batch_size = overflow_batch["input_ids"].size(0) + curr_mapped_batch["input_ids"].size(0)
                         max_num_images = max(
-                            overflow_batch["pixel_values"].size(1) if "pixel_values" in overflow_batch else 0,
-                            curr_mapped_batch["pixel_values"].size(1) if "pixel_values" in curr_mapped_batch else 0,
+                            overflow_batch["pixel_values"].size(1) if self._batch_has_images(overflow_batch) else 0,
+                            curr_mapped_batch["pixel_values"].size(1) if self._batch_has_images(curr_mapped_batch) else 0,
                         )
                         max_height = max(
-                            overflow_batch["pixel_values"].size(3) if "pixel_values" in overflow_batch else 0,
-                            curr_mapped_batch["pixel_values"].size(3) if "pixel_values" in curr_mapped_batch else 0,
+                            overflow_batch["pixel_values"].size(3) if self._batch_has_images(overflow_batch) else 0,
+                            curr_mapped_batch["pixel_values"].size(3) if self._batch_has_images(curr_mapped_batch) else 0,
                         )
                         max_width = max(
-                            overflow_batch["pixel_values"].size(4) if "pixel_values" in overflow_batch else 0,
-                            curr_mapped_batch["pixel_values"].size(4) if "pixel_values" in curr_mapped_batch else 0,
+                            overflow_batch["pixel_values"].size(4) if self._batch_has_images(overflow_batch) else 0,
+                            curr_mapped_batch["pixel_values"].size(4) if self._batch_has_images(curr_mapped_batch) else 0,
                         )
                         padded_image_tensor = torch.zeros(total_batch_size, max_num_images, 3, max_height, max_width)
                         padded_pixel_attention_masks = torch.zeros(
