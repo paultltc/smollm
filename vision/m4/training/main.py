@@ -4,17 +4,20 @@ import os
 import sys
 import time
 from datetime import timedelta
+from functools import partial
 
 import accelerate
 import datasets
 import torch
 import transformers
 from accelerate import Accelerator, InitProcessGroupKwargs
+from accelerate.utils import GradientAccumulationPlugin
 from accelerate.state import AcceleratorState
 from peft import LoraConfig, PeftConfig
 from torch.profiler.profiler import ProfilerActivity, profile, tensorboard_trace_handler
 from transformers import AddedToken  # AddedToken is needed for the eval of the tokenizer params # noqa: F401
 from transformers import AutoTokenizer  # noqa: F401
+from transformers import AutoProcessor
 from transformers.utils import ContextManagers, is_torch_tf32_available
 
 import m4
@@ -40,6 +43,29 @@ if not M4_DISABLE_RICH:
 
 logger = logging.getLogger(__name__)
 
+def set_logging_levels(log_level):
+    """
+    Set the logging levels for the libraries used in this script.
+    """
+    m4.utils.logging.set_verbosity(log_level)
+    datasets.utils.logging.set_verbosity(logging.WARNING)
+    transformers.utils.logging.set_verbosity(logging.WARNING)
+    if AcceleratorState().deepspeed_plugin is not None:
+        from deepspeed.utils import logger as ds_logger
+        ds_logger.setLevel(log_level)
+
+def _init_accelerator(grad_acc_steps, timeout_seconds=60):
+    """
+    Initialize the accelerator with the appropriate settings.
+    """
+    kwargs_handlers = [InitProcessGroupKwargs(timeout=timedelta(seconds=timeout_seconds))]
+    return Accelerator(
+        log_with="all",
+        rng_types=["torch", "cuda", "generator"],
+        gradient_accumulation_steps=grad_acc_steps,
+        kwargs_handlers=kwargs_handlers,
+    )
+
 if __name__ == "__main__":
     START_TIME = time.time()
 
@@ -49,17 +75,18 @@ if __name__ == "__main__":
 
     config = get_config()
 
+    # if hparams.save_dir doesnot exist, create it
+    if not config.hparams.save_dir.exists():
+        os.makedirs(config.hparams.save_dir, exist_ok=True)
+
     # @TEMPORARY GATE -- if resuming, `realtime_processing` must be True
     if config.hparams.resume_run and not config.data_param.realtime_processing:
         raise NotImplementedError("Instant resume functionality not yet supported for non-iterable datasets!")
 
     # Initialize accelerator
-    kwargs_handlers = [InitProcessGroupKwargs(timeout=timedelta(seconds=config.hparams.timeout))]
-    accelerator = Accelerator(
-        log_with="all",
-        rng_types=["torch", "cuda", "generator"],
-        gradient_accumulation_steps=config.hparams.grad_acc_size,
-        kwargs_handlers=kwargs_handlers,
+    accelerator = _init_accelerator(
+        grad_acc_steps=config.hparams.grad_acc_size,
+        timeout_seconds=60
     )
 
     if config.hparams.timing_break_down:
@@ -71,13 +98,7 @@ if __name__ == "__main__":
 
     # logger behavior - this and sub-systems
     main_process_log_level = m4.utils.logging.get_log_levels_dict()[os.getenv("M4_VERBOSITY", "info")]
-    log_level = main_process_log_level if accelerator.is_main_process else logging.ERROR
-    m4.utils.logging.set_verbosity(log_level)
-    datasets.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.set_verbosity(log_level)
-    if AcceleratorState().deepspeed_plugin is not None:
-        from deepspeed.utils import logger as ds_logger
-        ds_logger.setLevel(log_level)
+    set_logging_levels(main_process_log_level if accelerator.is_main_process else logging.ERROR)
 
     if config.hparams.kill_switch_path is not None and config.hparams.kill_switch_path.exists():
         logger.info("** Kill switch activated. Exiting the training before it even starts. **")
@@ -85,10 +106,11 @@ if __name__ == "__main__":
 
     accelerate.utils.set_seed(config.hparams.seed)
 
-    logger.info(f"** The job is running with the following arguments: **\n{config}\n **** ")
+    # logger.info(f"** The job is running with the following arguments: **\n{config}\n **** ")
 
     # Load model
     vl_model = config.load_model(torch_dtype=accelerate_torch_dtype())
+    vl_model = vl_model.to(accelerate_torch_dtype())
 
     # If we want to use_lora and are starting a pretraining, or if we want to use a new lora for fine tuning, create the config and add the adapter.
     if (
@@ -125,21 +147,26 @@ if __name__ == "__main__":
                 param.requires_grad_(True)
 
     # Get the seq_len for a single image as it is necesssary for packing
-    single_image_seq_len = (
-        vl_model.config.perceiver_config.resampler_n_latents
-        if hasattr(vl_model.config, "use_resampler") and vl_model.config.use_resampler
-        else int(((vl_model.config.vision_config.image_size // vl_model.config.vision_config.patch_size) ** 2) / (vl_model.config.pixel_shuffle_factor**2))
-        # else (vl_model.config.vision_config.image_size // vl_model.config.vision_config.patch_size) ** 2
-    )
+    if vl_model.config.vision_config.image_size is not None:
+        single_image_seq_len = (
+            vl_model.config.perceiver_config.resampler_n_latents
+            if hasattr(vl_model.config, "use_resampler") and vl_model.config.use_resampler
+            else int(((vl_model.config.vision_config.image_size // vl_model.config.vision_config.patch_size) ** 2) / (vl_model.config.pixel_shuffle_factor**2))
+            # else (vl_model.config.vision_config.image_size // vl_model.config.vision_config.patch_size) ** 2
+        )
+    else:
+        # If the image size is not defined, we cannot compute the seq_len for a single image.
+        # This is the case for some models like CLIP.
+        single_image_seq_len = None
 
     if config.hparams.timing_break_down:
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             time_deltas["model_load"] = timer1.delta()
 
-    # Load tokenizer
-    tokenizer = config.get_tokenizer(model_vocab_size=vl_model.config.vocab_size)
-    # tokenizer.pad_token_id = 2      # TODO: Why is this necessary? Should be handled by the tokenizer itself
+    # Load tokenizer and image processor
+    tokenizer = config.hparams.get_tokenizer(model_vocab_size=vl_model.config.vocab_size)
+    image_processor = AutoProcessor.from_pretrained(vl_model.config.vision_config.vision_model_name).image_processor
 
     if config.hparams.timing_break_down:
         accelerator.wait_for_everyone()
@@ -152,30 +179,16 @@ if __name__ == "__main__":
         if encoder_type.value in vision_model_name.lower():
             vision_encoder_type = encoder_type
             break
+
     train_image_transforms = {}
     val_image_transforms = {}
     for dataset_name in DatasetNames:
         dataset_param = getattr(config.data_param, dataset_name.value)
         setattr(dataset_param, "vision_encoder_max_image_size", vl_model.config.vision_config.image_size)
-        train_image_transform = build_image_transform(
-            max_image_size=vl_model.config.vision_config.image_size,
-            min_image_size=dataset_param.min_image_size,
-            image_size=None,
-            vision_encoder_type=vision_encoder_type,
-            dataset_name=dataset_name,
-            scale_up_max=dataset_param.scale_up_max,
-            scale_up_frequency=dataset_param.scale_up_frequency,
-        )
-        train_image_transforms[dataset_name.name.lower()] = train_image_transform
-        val_image_transform = build_image_transform(
-            max_image_size=vl_model.config.vision_config.image_size,
-            min_image_size=dataset_param.min_image_size,
-            image_size=None,
-            eval=True,
-            vision_encoder_type=vision_encoder_type,
-            dataset_name=dataset_name,
-        )
-        val_image_transforms[dataset_name.name.lower()] = val_image_transform
+        if dataset_param.vision_encoder_max_image_size is None:   
+            setattr(dataset_param, "pre_split_scale_up_frequency", 0.0)
+        train_image_transforms[dataset_name.name.lower()] = partial(image_processor, return_tensors="pt")   # to get tensors as outputs
+        val_image_transforms[dataset_name.name.lower()] = partial(image_processor, return_tensors="pt")   # to get tensors as outputs
 
     # Initialize data loaders
     if accelerator.is_local_main_process:

@@ -1,10 +1,11 @@
 #!/bin/bash
 #SBATCH -A nwd@h100
 #SBATCH -C h100
-#SBATCH --nodes=1
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:4
-#SBATCH --time=20:00:00
+#SBATCH --time=48:00:00
+#SBATCH --qos=qos_gpu_h100-t4
 #SBATCH --job-name=modality_align
 #SBATCH --mem-bind=local
 #SBATCH --cpus-per-task=64
@@ -46,17 +47,28 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # dynamic memory alloc
 
 echo "launching script"
 
-ACCELERATE_CONFIG_FILE="${ACCELERATE_HOME}/zero1.yaml"
+MASTER_ADDR=`scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1`
+MASTER_PORT=6001 # Most of the ports are available (and if not, there will be an error thrown out)
+ACCELERATE_CONFIG_FILE="${ACCELERATE_HOME}/zero2_multi_node.yaml"
 
-SRUN_ARGS=" \
+export SRUN_ARGS=" \
     --label \
     --wait=60 \
     --kill-on-bad-exit=1 \
     "
 
-CMD="PYTHONPATH=$(pwd) accelerate launch \
-        --config_file ${ACCELERATE_CONFIG_FILE} \
-        m4/training/main.py \
-        --config ${CONFIG_FILE}"
+export LAUNCHER="PYTHONPATH=$(pwd) accelerate launch \
+    --config_file $ACCELERATE_CONFIG_FILE \
+    --main_process_ip $MASTER_ADDR \
+    --main_process_port $MASTER_PORT \
+    --machine_rank \$SLURM_PROCID \
+    "
+
+export PROGRAM=" \
+    m4/training/main.py \
+        --config $CONFIG_FILE \
+    "
+
+export CMD="$LAUNCHER $PROGRAM"
 
 srun $SRUN_ARGS --jobid $SLURM_JOBID bash -c "$CMD" 2>&1 | tee -a ${SCRATCH}/logs/modality_alignment/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.log

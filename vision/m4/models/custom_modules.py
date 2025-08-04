@@ -4,22 +4,29 @@ import json
 
 from dataclasses import dataclass
 
+from abc import ABC, abstractmethod
+
 import torch
 import torch.nn.functional as F
 from torch import nn
-from transformers import AutoConfig, AutoModel, PretrainedConfig, PreTrainedModel
+from transformers import AutoConfig, AutoModel, PretrainedConfig, PreTrainedModel, AutoModelForMaskedLM
 from transformers.utils import ContextManagers
 
-from m4.training.setup_vision_model import vision_model_name_to_model
 from m4.training.utils import (
     deepspeed_zero_init_disabled_context_manager,
     is_deepspeed_zero_init_enabled,
     load_state_dict_into_model,
 )
+from m4.training.debug_utils import (
+    model_is_correctly_loaded_from_other
+)
 
 
 # from pathlib import Path
 
+
+import logging
+logger = logging.getLogger(__name__)
 
 class VLOOMPreTrainedModelBase(PreTrainedModel):
     # The problem we are trying to solve is 2 nested zero.Init thanks to fetching from_pretrained(vision_model_name)
@@ -32,23 +39,41 @@ class VLOOMPreTrainedModelBase(PreTrainedModel):
     # 1. one variant is to hack into accelerate's deepspeed_plugin and turn off zero.Init while loading the vision model
     # 2. the other variant is to override _from_config method with our version that doesn't do zero.Init
 
-    @classmethod
-    def override_vision_model(cls, model, vision_model_name, vision_config, torch_dtype):
-        vision_config["torch_dtype"] = torch_dtype
-        # 1. fetch the pretrained vision model w/o zero.Init
-        with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
-            vision_model = AutoModel.from_pretrained(vision_model_name, **vision_config, trust_remote_code=True)
+    # @staticmethod
+    # def override_vision_model(model, vision_model_name, vl_config, **kwargs):
+    #     base_model = model.model if hasattr(model, "model") else model
+    #     vision_model = base_model.vision_model
 
-        # this extracts the desired submodule if the part we want is nested (e.g. as in clip)
-        real_vision_model = vision_model_name_to_model(vision_model_name, vision_model)
+    #     # 1. fetch the pretrained vision model w/o zero.Init
+    #     with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+    #         pretrained_model = AutoModel.from_pretrained(vision_model_name, trust_remote_code=True, **kwargs)
 
-        # 2. now override the weights already sharded by zero.Init with the weights from the real_vision_model
-        # by gradually gathering sharded weights and replacing with new weights
-        if is_deepspeed_zero_init_enabled():
-            state_dict = real_vision_model.state_dict()
-            load_state_dict_into_model(model.vision_model, state_dict, start_prefix="")
-        else:
-            model.vision_model = real_vision_model
+    #     # 2. now override the weights already sharded by zero.Init with the weights from the real_vision_model
+    #     # by gradually gathering sharded weights and replacing with new weights
+    #     start_prefix = "vision_model." if hasattr(pretrained_model, "vision_model") else ""
+    #     load_state_dict_into_model(base_model.vision_model, pretrained_model.state_dict(), start_prefix=start_prefix)
+   
+    # @staticmethod
+    # def override_text_model(model, text_model_name, vl_config, **kwargs):
+    #     base_model = model.model if hasattr(model, "model") else model
+
+    #     # 1. fetch the pretrained text model w/o zero.Init
+    #     with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+    #         pretrained_model = AutoModel.from_pretrained(text_model_name, trust_remote_code=True, **kwargs)
+
+    #     # 2. now override the weights already sharded by zero.Init with the weights from the real_text_model
+    #     # by gradually gathering sharded weights and replacing with new weights
+    #     load_state_dict_into_model(base_model.text_model, pretrained_model.state_dict(), start_prefix="")
+
+    # @staticmethod
+    # def override_lm_head(model, text_model_name, vl_config, **kwargs):
+    #     # 1. fetch the pretrained text model w/o zero.Init
+    #     with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+    #         pretrained_model = AutoModelForMaskedLM.from_pretrained(text_model_name, trust_remote_code=True, **kwargs)
+            
+    #     # 2. now override the weights already sharded by zero.Init with the weights from the real_text_model
+    #     # by gradually gathering sharded weights and replacing with new weights
+    #     load_state_dict_into_model(model.lm_head, pretrained_model.state_dict(), start_prefix="lm_head.")
 
     @classmethod
     def from_config(cls, config, **kwargs):
@@ -56,13 +81,43 @@ class VLOOMPreTrainedModelBase(PreTrainedModel):
         return model
 
     @classmethod
-    def from_pretrained_models(cls, *args, **kwargs):
+    def from_pretrained_models(
+        cls, 
+        text_model_name,
+        vision_model_name,
+        vl_config,
+        *args, 
+        **kwargs
+    ):
         """
         Use this method when creating a new vloom model that hasn't been yet trained and it'll be
         composed of 2 pre-trained models - hence `pretrained_models`.
         """
+        # Build the model from the config
+        model = cls(vl_config, *args, **kwargs)
 
-        return cls.from_pretrained(*args, **kwargs, new_model=True)
+        with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
+            # fetch the pretrained text model w/o zero.Init
+            pretrained_text_model = AutoModel.from_pretrained(
+                text_model_name, trust_remote_code=True, **kwargs
+            )
+            # fetch the pretrained vision model w/o zero.Init
+            pretrained_vision_model = AutoModel.from_pretrained(
+                vision_model_name, trust_remote_code=True, **kwargs
+            )
+            if hasattr(pretrained_vision_model, "vision_model"):
+                pretrained_vision_model = pretrained_vision_model.vision_model
+        
+        # Load the text model
+        load_state_dict_into_model(model.base_model.text_model, pretrained_text_model.state_dict(), start_prefix="")
+
+        # Load the vision model
+        load_state_dict_into_model(model.base_model.vision_model, pretrained_vision_model.state_dict(), start_prefix="")
+
+        # model_is_correctly_loaded_from_other(model.model.text_model, text_model_name, **kwargs)   # Debug
+        # model_is_correctly_loaded_from_other(model.model.vision_model, vision_model_name, **kwargs)   # Debug
+        
+        return model
 
     @classmethod
     def from_pretrained(cls, *model_args, is_resume=False, new_model=False, **kwargs):

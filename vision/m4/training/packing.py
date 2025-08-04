@@ -13,7 +13,8 @@ import torch
 
 import PIL
 
-from m4.training.utils import END_OF_UTTERANCE_TOKEN, FAKE_TOKEN_AROUND_IMAGE_V2, IMAGE_TOKEN, image_splitting, ASSISTANT_TOKEN
+from transformers import BatchFeature
+from m4.training.utils import END_OF_UTTERANCE_TOKEN, FAKE_TOKEN_AROUND_IMAGE_V2, IMAGE_TOKEN, image_splitting, ASSISTANT_TOKEN, USER_TOKEN, PATCH_POSITION_TOKEN
 
 
 logger = logging.getLogger(__name__)
@@ -26,48 +27,81 @@ _MIN_LENGTH_DOCUMENTS_TO_PACK = (
 )
 RANDOM_LINE_BREAK_PROB = 0.05
 
-
-def get_splitted_images_and_corresponding_text(
-    image,
-    vision_encoder_max_image_size,
-    max_image_size,
-    pre_split_scale_up_max,
-    pre_split_scale_up_frequency,
-    image_seq_len,
-    scale_up_factor=None,
-):
-    splitted_images_array, image_rows, image_cols = image_splitting(
-        image=image,
-        vision_encoder_max_image_size=vision_encoder_max_image_size,
-        max_image_size=max_image_size,
-        pre_split_scale_up_max=pre_split_scale_up_max,
-        pre_split_scale_up_frequency=pre_split_scale_up_frequency,
-        scale_up_factor=scale_up_factor,
-    )
-    if len(splitted_images_array) > 1:
-        text_splitted_images = ""
-        for n_h in range(image_rows):
-            for n_w in range(image_cols):
-                text_splitted_images += (
-                    f"{FAKE_TOKEN_AROUND_IMAGE_V2}"
-                    + f"<row_{n_h + 1}_col_{n_w + 1}>"
-                    + f"{IMAGE_TOKEN}" * image_seq_len
-                )
-            text_splitted_images += "\n"
-        text_splitted_images += (
-            f"\n{FAKE_TOKEN_AROUND_IMAGE_V2}"
-            + "<global-img>"
-            + f"{IMAGE_TOKEN}" * image_seq_len
-            + f"{FAKE_TOKEN_AROUND_IMAGE_V2}"
-        )
-    else:
-        text_splitted_images = (
+def _get_image_split_text(image_rows, image_cols, image_seq_len):
+    if image_rows == 0 and image_cols == 0:
+        return (
             f"{FAKE_TOKEN_AROUND_IMAGE_V2}"
             + "<global-img>"
             + f"{IMAGE_TOKEN}" * image_seq_len
             + f"{FAKE_TOKEN_AROUND_IMAGE_V2}"
         )
-    return splitted_images_array, text_splitted_images
+    text_splitted_images = ""
+    for n_h in range(image_rows):
+        for n_w in range(image_cols):
+            text_splitted_images += (
+                f"{FAKE_TOKEN_AROUND_IMAGE_V2}"
+                # + f"<row_{n_h + 1}_col_{n_w + 1}>"
+                + PATCH_POSITION_TOKEN.format(row=n_h + 1, col=n_w + 1)
+                + f"{IMAGE_TOKEN}" * image_seq_len
+            )
+        text_splitted_images += "\n"
+    text_splitted_images += (
+        f"\n{FAKE_TOKEN_AROUND_IMAGE_V2}"
+        + "<global-img>"
+        + f"{IMAGE_TOKEN}" * image_seq_len
+        + f"{FAKE_TOKEN_AROUND_IMAGE_V2}"
+    )
+    return text_splitted_images
+
+def preprocess_image(
+    image,
+    image_transform,
+    image_seq_len,
+    **image_splitting_kwargs
+):
+    splitted_images_array, image_rows, image_cols = image_splitting(
+        image=image,
+        **image_splitting_kwargs
+    )
+
+    # process the images
+    proc_images = image_transform(splitted_images_array)
+
+    if "spatial_shapes" in proc_images and image_seq_len is None:
+        image_seq_len = proc_images["spatial_shapes"][:, 0] * proc_images["spatial_shapes"][:, 1]     # TODO: bring token pooling here
+
+    # generate the text matching the images splitting
+    text_splitted_images = _get_image_split_text(image_rows, image_cols, image_seq_len)
+
+    return proc_images, text_splitted_images
+
+
+def preprocess_images(
+    images,
+    image_transform,
+    image_seq_len,
+    **image_splitting_kwargs
+):
+    splitted_images = []
+    splits_shapes = []
+    for image in images:
+        splitted_images_array, image_rows, image_cols = image_splitting(
+            image=image,
+            **image_splitting_kwargs
+        )
+        splitted_images.extend(splitted_images_array)
+        splits_shapes.append((image_rows, image_cols))
+
+    # process the images
+    if len(splitted_images) == 0:
+        return splitted_images, ""
+    
+    processed_images = image_transform(splitted_images)
+    # if "spatial_shapes" in processed_images and image_seq_len is None:
+    #     image_seq_len = processed_images["spatial_shapes"][:, 0] * processed_images["spatial_shapes"][:, 1]  # TODO: bring token pooling here
+    text_splitted_images = "".join(_get_image_split_text(rows, cols, image_seq_len) for (rows, cols) in splits_shapes)
+
+    return processed_images.pixel_values, text_splitted_images
 
 
 def remove_extra_images(
@@ -164,12 +198,6 @@ def greedy_packing(
     fake_token_around_image_id: int,
     image_token_id: int,
     double_breaking_lines_token_ids: List[int],
-    output_input_ids: List[torch.IntTensor] = [],
-    output_images: List[torch.FloatTensor] = [],
-    output_attention_masks: List[torch.IntTensor] = [],
-    output_pixel_attention_masks: List[torch.BoolTensor] = [],
-    output_num_images: List[int] = [],
-    output_num_text_tokens: List[int] = [],
     truncate_images_within_same_example: bool = False,
 ):
     """
@@ -226,11 +254,11 @@ def greedy_packing(
                 new_ex[1].extend(images_)
                 batch.append(new_ex)
 
-    for i in range(len(batch)):
-        input_ids_ = batch[i][0]
-        images_ = batch[i][1]
+    if truncate_images_within_same_example:
+        for i in range(len(batch)):
+            input_ids_ = batch[i][0]
+            images_ = batch[i][1]
 
-        if truncate_images_within_same_example:
             # First, we remove some images from the batch examples if there are
             # more than max_num_images
             num_images_to_discard = len(images_) - max_num_images
@@ -244,30 +272,67 @@ def greedy_packing(
                     image_token_id=image_token_id,
                     double_breaking_lines_token_ids=double_breaking_lines_token_ids,
                 )
-        else:
-            if len(images_) > max_num_images:
-                raise ValueError("We should have fewer images than `max_num_images`")
+                batch[i][0] = input_ids_
+                batch[i][1] = images_
 
-        # We have hanging issues for examples without any images
-        if len(images_) == 0:
-            continue
+    assert all(len(batch[i][0]) <= max_seq_len and len(batch[i][1]) <= max_num_images for i in range(len(batch))), \
+        "Some input_ids are longer than max_seq_len or some images are longer than max_num_images"
 
-        # Then, we pad and prepare the final tensors
+    return batch
+
+def prepare_batch(
+    batch: List[tuple],
+    max_num_images: int,
+    max_seq_len: int,
+    image_seq_len: int,
+    fake_token_around_image_id: int,
+    image_token_id: int,
+    pad_token_id: int,
+):
+    """
+    This function returns the end dictionary at the exit of the dataloader.
+    Mostly batchify things and pad accordingly.
+    """
+    if len(batch) == 0:
+        result = {
+            "input_ids": torch.tensor([], dtype=torch.long),
+            "attention_mask": torch.tensor([], dtype=torch.bool),
+            "pixel_attention_mask": torch.tensor([], dtype=torch.bool),
+            "num_images": torch.tensor([], dtype=torch.long),
+            "num_text_tokens": torch.tensor([], dtype=torch.long),
+            "pixel_values": torch.tensor([], dtype=torch.float32),
+        }
+        return result
+
+    output_input_ids = []
+    output_images = []
+    output_attention_masks = []
+    output_pixel_attention_masks = []
+    output_num_images = []
+    output_num_text_tokens = []
+    
+    for input_ids_, images_ in batch:
+        seq_len = len(input_ids_)
+        num_images = len(images_)
+        num_im_tokens = len([tok for tok in input_ids_ if tok in [fake_token_around_image_id, image_token_id]])
+
         # First we pad the input_ids
-        len_sample = len(input_ids_)
-        num_tokens_for_images = len([tok for tok in input_ids_ if tok in [fake_token_around_image_id, image_token_id]])
-        if len_sample < max_seq_len:
-            input_ids_ = input_ids_ + [pad_token_id] * (max_seq_len - len_sample)
+        if seq_len < max_seq_len:
+            input_ids_ = input_ids_ + [pad_token_id] * (max_seq_len - seq_len)
+        input_ids_ = torch.tensor(input_ids_)
 
-        # Second we pad the image and pixel attention mask tensors
-        # Max height and width of image accross individual samples
-        if len(images_) > 0:
-            max_height = max([im.size(1) for im in images_])
-            max_width = max([im.size(2) for im in images_])
+        # Then we pad the input_ids attention mask tensors
+        attention_mask = torch.zeros((max_seq_len,), dtype=torch.long)
+        attention_mask[:seq_len] = 1
+
+        # Last we pad the image and pixel attention mask tensors
+        if num_images > 0:
+            max_height = max([im.size(-2) for im in images_])
+            max_width = max([im.size(-1) for im in images_])
             padded_image_tensor = torch.zeros(max_num_images, 3, max_height, max_width)
             padded_pixel_attention_mask = torch.zeros(max_num_images, max_height, max_width, dtype=torch.bool)
             for idx, im in enumerate(images_):
-                im_height, im_width = im.size()[1:]
+                im_height, im_width = im.size()[-2:]
                 padded_image_tensor[idx, :, :im_height, :im_width] = im
                 padded_pixel_attention_mask[idx, :im_height, :im_width] = True
             padded_image_tensor = padded_image_tensor.contiguous()
@@ -275,11 +340,6 @@ def greedy_packing(
         else:
             padded_image_tensor = None
             padded_pixel_attention_mask = None
-
-        # Last we pad the input ids attention mask tensors
-        attention_mask = torch.zeros((max_seq_len,), dtype=torch.long)
-        attention_mask[:len_sample] = 1
-        input_ids_ = torch.tensor(input_ids_)
 
         # Safety check to avoid batches with an unexpected amount of image_token_ids
         if (input_ids_ == image_token_id).sum() != image_seq_len * len(images_):
@@ -291,47 +351,16 @@ def greedy_packing(
             continue
 
         output_input_ids.append(input_ids_)
-        output_num_text_tokens.append(len_sample - num_tokens_for_images)
         output_attention_masks.append(attention_mask)
+        output_num_text_tokens.append(seq_len - num_im_tokens)
         output_images.append(padded_image_tensor)
         output_pixel_attention_masks.append(padded_pixel_attention_mask)
         output_num_images.append(len(images_))
 
-    return (
-        output_input_ids,
-        output_images,
-        output_attention_masks,
-        output_pixel_attention_masks,
-        output_num_images,
-        output_num_text_tokens,
-    )
-
-
-def prepare_result_return(
-    output_input_ids,
-    output_images,
-    output_attention_masks,
-    output_pixel_attention_masks,
-    output_num_images,
-    output_num_text_tokens,
-):
-    """
-    This function returns the end dictionary at the exit of the dataloader.
-    Mostly batchify things and pad accordingly.
-    """
-    if len(output_images) == 0 or len(output_input_ids) == 0:
-        result = {
-            "input_ids": torch.tensor([], dtype=torch.long),
-            "attention_mask": torch.tensor([], dtype=torch.bool),
-            "pixel_attention_mask": torch.tensor([], dtype=torch.bool),
-            "num_images": torch.tensor([], dtype=torch.long),
-            "num_text_tokens": torch.tensor([], dtype=torch.long),
-            "pixel_values": torch.tensor([], dtype=torch.float32),
-        }
-        return result
-
     output_input_ids = torch.stack(output_input_ids)
     output_attention_masks = torch.stack(output_attention_masks)
+    output_num_text_tokens = torch.tensor(output_num_text_tokens)
+    output_num_images = torch.tensor(output_num_images)
 
     total_batch_size = len(output_images)
     max_num_images = max([i.size(0) if i is not None else 0 for i in output_images])
@@ -366,13 +395,13 @@ def prepare_result_return(
     result = {
         "input_ids": output_input_ids[sort_by_padding],
         "attention_mask": output_attention_masks[sort_by_padding],
-        "num_images": torch.tensor(output_num_images)[sort_by_padding],
-        "num_text_tokens": torch.tensor(output_num_text_tokens)[sort_by_padding],
+        "num_images": output_num_images[sort_by_padding],
+        "num_text_tokens": output_num_text_tokens[sort_by_padding],
     }
-    if padded_pixel_attention_masks is not None:
-        result["pixel_attention_mask"] = padded_pixel_attention_masks[sort_by_padding]
     if padded_image_tensor is not None:
         result["pixel_values"] = padded_image_tensor[sort_by_padding]
+    if padded_pixel_attention_masks is not None:
+        result["pixel_attention_mask"] = padded_pixel_attention_masks[sort_by_padding]
 
     # if output_labels:
     #     output_labels = torch.stack(output_labels)
@@ -531,7 +560,7 @@ def split_pack_and_pad_webdocs(
                     continue
 
                 if image is not None:
-                    splitted_image_array, text_splitted_images = get_splitted_images_and_corresponding_text(
+                    splitted_image_array, text_splitted_images = preprocess_image(
                         image=image,
                         vision_encoder_max_image_size=vision_encoder_max_image_size,
                         max_image_size=max_image_size,
@@ -818,7 +847,7 @@ def split_pack_and_pad_webdocs(
             truncate_images_within_same_example=False,
         )
 
-    result = prepare_result_return(
+    result = prepare_batch(
         output_input_ids=output_input_ids,
         output_images=output_images,
         output_attention_masks=output_attention_masks,
@@ -873,7 +902,7 @@ def split_pack_and_pad_pairs(
         if (text is not None) and ((FAKE_TOKEN_AROUND_IMAGE_V2 in text) or (IMAGE_TOKEN in text)):
             continue
 
-        splitted_image_array, sample_text = get_splitted_images_and_corresponding_text(
+        splitted_image_array, sample_text = preprocess_image(
             image=image,
             vision_encoder_max_image_size=vision_encoder_max_image_size,
             max_image_size=max_image_size,
@@ -901,19 +930,9 @@ def split_pack_and_pad_pairs(
 
         filtered_input_ids.append(sample_input_ids)
 
-    input_ids_to_pack = filtered_input_ids
-    images_to_pack = filtered_image_batch
-
-    (
-        output_input_ids,
-        output_images,
-        output_attention_masks,
-        output_pixel_attention_masks,
-        output_num_images,
-        output_num_text_tokens,
-    ) = greedy_packing(
-        input_ids_to_pack=input_ids_to_pack,
-        images_to_pack=images_to_pack,
+    batch = greedy_packing(
+        input_ids_to_pack=filtered_input_ids,
+        images_to_pack=filtered_image_batch,
         max_seq_len=max_seq_len,
         max_num_images=MAX_NUM_IMAGES_AFTER_SPLIT,
         image_seq_len=image_seq_len,
@@ -921,21 +940,17 @@ def split_pack_and_pad_pairs(
         fake_token_around_image_id=fake_token_around_image_id,
         image_token_id=image_token_id,
         double_breaking_lines_token_ids=double_breaking_lines_token_ids,
-        output_input_ids=[],
-        output_images=[],
-        output_attention_masks=[],
-        output_pixel_attention_masks=[],
-        output_num_images=[],
-        output_num_text_tokens=[],
         truncate_images_within_same_example=False,
     )
-    result = prepare_result_return(
-        output_input_ids=output_input_ids,
-        output_images=output_images,
-        output_attention_masks=output_attention_masks,
-        output_pixel_attention_masks=output_pixel_attention_masks,
-        output_num_images=output_num_images,
-        output_num_text_tokens=output_num_text_tokens,
+
+    result = prepare_batch(
+        batch,
+        max_num_images=MAX_NUM_IMAGES_AFTER_SPLIT,
+        max_seq_len=max_seq_len,
+        image_seq_len=image_seq_len,
+        pad_token_id=pad_token_id,
+        fake_token_around_image_id=fake_token_around_image_id,
+        image_token_id=image_token_id,
     )
     return result
 
@@ -1020,7 +1035,7 @@ def split_pack_and_pad_ocr(
         for i, (curr_image, curr_text) in enumerate(zip(image_list, text_list)):
             curr_text_sublist.append(curr_text)
 
-            splitted_image_array, curr_image_text = get_splitted_images_and_corresponding_text(
+            splitted_image_array, curr_image_text = preprocess_image(
                 image=curr_image,
                 vision_encoder_max_image_size=vision_encoder_max_image_size,
                 max_image_size=max_image_size,
@@ -1096,14 +1111,7 @@ def split_pack_and_pad_ocr(
                     curr_text_sublist = []
                     curr_image_sublist_text = ""
 
-    (
-        output_input_ids,
-        output_images,
-        output_attention_masks,
-        output_pixel_attention_masks,
-        output_num_images,
-        output_num_text_tokens,
-    ) = greedy_packing(
+    batch = greedy_packing(
         input_ids_to_pack=filtered_input_ids,
         images_to_pack=filtered_image_batch,
         max_seq_len=max_seq_len,
@@ -1113,21 +1121,17 @@ def split_pack_and_pad_ocr(
         fake_token_around_image_id=fake_token_around_image_id,
         image_token_id=image_token_id,
         double_breaking_lines_token_ids=double_breaking_lines_token_ids,
-        output_input_ids=[],
-        output_images=[],
-        output_attention_masks=[],
-        output_pixel_attention_masks=[],
-        output_num_images=[],
-        output_num_text_tokens=[],
         truncate_images_within_same_example=False,
     )
-    result = prepare_result_return(
-        output_input_ids=output_input_ids,
-        output_images=output_images,
-        output_attention_masks=output_attention_masks,
-        output_pixel_attention_masks=output_pixel_attention_masks,
-        output_num_images=output_num_images,
-        output_num_text_tokens=output_num_text_tokens,
+
+    result = prepare_batch(
+        batch,
+        max_num_images=MAX_NUM_IMAGES_AFTER_SPLIT,
+        max_seq_len=max_seq_len,
+        image_seq_len=image_seq_len,
+        pad_token_id=pad_token_id,
+        fake_token_around_image_id=fake_token_around_image_id,
+        image_token_id=image_token_id,
     )
     return result
 
@@ -1224,6 +1228,8 @@ def split_pack_and_pad_iqa_finetuning(
 
 
 # Sft
+MAX_NUMBER_OF_TURNS = 7
+LIST_OF_SFT_DATASETS_WITH_TURNS_ORDER = ["ny_cc_ranking"]
 def split_pack_and_pad_sft(
     sample,
     tokenizer,
@@ -1239,15 +1245,10 @@ def split_pack_and_pad_sft(
     add_begin_of_doc_token=True,
     add_end_of_doc_token=True,
 ):
-    MAX_NUMBER_OF_TURNS = 1
-    LIST_OF_SFT_DATASETS_WITH_TURNS_ORDER = ["ny_cc_ranking"]
-    pad_token_id = tokenizer.pad_token_id
-    image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
-    fake_token_around_image_id = tokenizer.convert_tokens_to_ids(FAKE_TOKEN_AROUND_IMAGE_V2)
-    MAX_NUM_IMAGE_ROWS_AND_COLUMNS = math.ceil(max_image_size / vision_encoder_max_image_size)
-    MAX_NUM_IMAGES_AFTER_SPLIT = (
-        MAX_NUM_IMAGE_ROWS_AND_COLUMNS**2 + 1 * (MAX_NUM_IMAGE_ROWS_AND_COLUMNS != 1)
-    ) * max_num_images
+    if vision_encoder_max_image_size is None:
+        MAX_NUM_IMAGE_ROWS_AND_COLUMNS = 1
+    else:
+        MAX_NUM_IMAGE_ROWS_AND_COLUMNS = math.ceil(max_image_size / vision_encoder_max_image_size)
     # We need to encode the \n\n with another token that we remove afterwards to prevent the tokenizer from generating
     # the prefix token.
     double_breaking_lines_token_ids = tokenizer.encode("_\n\n", add_special_tokens=False)
@@ -1275,19 +1276,38 @@ def split_pack_and_pad_sft(
             if any([(len(t["user"]) > 500) or (len(t["assistant"]) > 500) for t in turns]):
                 continue
 
-        images_text = ""
-        for idx_image, image in enumerate(images):
-            images[idx_image], text_splitted_images = get_splitted_images_and_corresponding_text(
-                image=image,
-                vision_encoder_max_image_size=vision_encoder_max_image_size,
-                max_image_size=max_image_size,
-                pre_split_scale_up_max=pre_split_scale_up_max,
-                pre_split_scale_up_frequency=pre_split_scale_up_frequency,
-                image_seq_len=image_seq_len,
-            )
-            images_text += text_splitted_images
+        # images_text = ""
+        # for idx_image, image in enumerate(images):
+        #     images[idx_image], text_splitted_images = preprocess_image(
+        #         image=image,
+        #         image_transform=image_transform,
+        #         image_seq_len=image_seq_len,
+        #         vision_encoder_max_image_size=vision_encoder_max_image_size,
+        #         max_image_size=max_image_size,
+        #         pre_split_scale_up_max=pre_split_scale_up_max,
+        #         pre_split_scale_up_frequency=pre_split_scale_up_frequency,
+        #     )
+        #     images_text += text_splitted_images
+        
+        # # flatten the list of batch
+        # if len(images) > 0: 
+        #     images = BatchFeature(data={k: torch.cat([d[k] for d in images], dim=0) for k in images[0].keys()})
+        # else:
+        #     images = BatchFeature(data={"pixel_values": torch.tensor([])})
 
-        images = [sub_el for el in images for sub_el in el]
+        image_splitting_kwargs = {
+            "vision_encoder_max_image_size": vision_encoder_max_image_size,
+            "max_image_size": max_image_size,
+            "pre_split_scale_up_max": pre_split_scale_up_max,
+            "pre_split_scale_up_frequency": pre_split_scale_up_frequency,
+        }
+        # preprocess sample images
+        images, images_text = preprocess_images(
+            images,
+            image_transform=image_transform,
+            image_seq_len=image_seq_len,
+            **image_splitting_kwargs,
+        )
 
         text = ""
         if turns[0]["source"] not in LIST_OF_SFT_DATASETS_WITH_TURNS_ORDER:
@@ -1298,13 +1318,13 @@ def split_pack_and_pad_sft(
             assistant_text = t["assistant"].strip()
             if idx == 0:
                 text += (
-                    f"User:{images_text if images_text else ' '}{random_linebreak}{user_text}{END_OF_UTTERANCE_TOKEN}{ASSISTANT_TOKEN}"
-                    f" {assistant_text}{END_OF_UTTERANCE_TOKEN}\n"
+                    f"{USER_TOKEN}{images_text if images_text else ' '}{random_linebreak}{user_text}{END_OF_UTTERANCE_TOKEN}"
+                    f"{ASSISTANT_TOKEN} {assistant_text}{END_OF_UTTERANCE_TOKEN}\n"
                 )
             else:
                 text += (
-                    f"User: {random_linebreak}{user_text}{END_OF_UTTERANCE_TOKEN}{ASSISTANT_TOKEN}"
-                    f" {assistant_text}{END_OF_UTTERANCE_TOKEN}\n"
+                    f"{USER_TOKEN}{random_linebreak}{user_text}{END_OF_UTTERANCE_TOKEN}"
+                    f"{ASSISTANT_TOKEN} {assistant_text}{END_OF_UTTERANCE_TOKEN}\n"
                 )
         # Remove trailing and leading whitespaces, including newlines and tabs
         text = text.strip("\n")
@@ -1312,28 +1332,25 @@ def split_pack_and_pad_sft(
         sample_input_ids = tokenizer.encode(text, add_special_tokens=False)
         if add_end_of_doc_token and not sample_input_ids[-1] == tokenizer.eos_token_id:
             sample_input_ids += [tokenizer.eos_token_id]
-
         if add_begin_of_doc_token and not sample_input_ids[0] == tokenizer.bos_token_id:
             sample_input_ids = [tokenizer.bos_token_id] + sample_input_ids
 
         if len(sample_input_ids) > max_seq_len:
             continue
-        filtered_image_batch.append([image_transform(im) for im in images])
+        filtered_image_batch.append(images)
         filtered_input_ids.append(sample_input_ids)
 
-    input_ids_to_pack = filtered_input_ids
-    images_to_pack = filtered_image_batch
+    pad_token_id = tokenizer.pad_token_id
+    image_token_id = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
+    fake_token_around_image_id = tokenizer.convert_tokens_to_ids(FAKE_TOKEN_AROUND_IMAGE_V2)
 
-    (
-        output_input_ids,
-        output_images,
-        output_attention_masks,
-        output_pixel_attention_masks,
-        output_num_images,
-        output_num_text_tokens,
-    ) = greedy_packing(
-        input_ids_to_pack=input_ids_to_pack,
-        images_to_pack=images_to_pack,
+    MAX_NUM_IMAGES_AFTER_SPLIT = (
+        MAX_NUM_IMAGE_ROWS_AND_COLUMNS**2 + 1 * (MAX_NUM_IMAGE_ROWS_AND_COLUMNS != 1)
+    ) * max_num_images
+
+    batch = greedy_packing(
+        input_ids_to_pack=filtered_input_ids,
+        images_to_pack=filtered_image_batch,
         max_seq_len=max_seq_len,
         max_num_images=MAX_NUM_IMAGES_AFTER_SPLIT,
         image_seq_len=image_seq_len,
@@ -1341,20 +1358,17 @@ def split_pack_and_pad_sft(
         fake_token_around_image_id=fake_token_around_image_id,
         image_token_id=image_token_id,
         double_breaking_lines_token_ids=double_breaking_lines_token_ids,
-        output_input_ids=[],
-        output_images=[],
-        output_attention_masks=[],
-        output_pixel_attention_masks=[],
-        output_num_images=[],
-        output_num_text_tokens=[],
         truncate_images_within_same_example=False,
     )
-    result = prepare_result_return(
-        output_input_ids=output_input_ids,
-        output_images=output_images,
-        output_attention_masks=output_attention_masks,
-        output_pixel_attention_masks=output_pixel_attention_masks,
-        output_num_images=output_num_images,
-        output_num_text_tokens=output_num_text_tokens,
+
+    result = prepare_batch(
+        batch,
+        max_num_images=MAX_NUM_IMAGES_AFTER_SPLIT,
+        max_seq_len=max_seq_len,
+        image_seq_len=image_seq_len,
+        pad_token_id=pad_token_id,
+        fake_token_around_image_id=fake_token_around_image_id,
+        image_token_id=image_token_id,
     )
+
     return result

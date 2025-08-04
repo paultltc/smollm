@@ -12,18 +12,18 @@ from m4.models.custom_modules import FreezeConfig
 
 logger = logging.get_logger(__name__)
 
-def collect_arg_in_candidates(config, candidates, default = None) -> Any:
+def collect_arg_in_candidates(config, candidates, default = None, strict = True) -> Any:
     """ Gets the argument in a config given a list of candidates """
     for c in candidates:
         if hasattr(config, c):
             return getattr(config, c)
         elif c in config:
             return config[c]
-    if default is not None:
+    if not strict:
         return default
     raise ValueError("No matching arguments found in candidates. Candidates: {}, Config: {}".format(candidates, config))
 
-class VBertTextConfig(PretrainedConfig):
+class ModernVBertTextConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`LlamaModel`]. It is used to instantiate an LLaMA
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -38,12 +38,11 @@ class VBertTextConfig(PretrainedConfig):
         image_size (`int`, *optional*, defaults to 384):
             The size (resolution) of each image.
     """
-    model_type = "vbert"
+    model_type = "modernvbert"
 
     def __init__(
         self,
-        # Case for when vllama3 is from the hub with no vision_model_name
-        text_model_name="EuroBERT/EuroBERT-210m",
+        text_model_name="answerdotai/ModernBERT-base",
         **kwargs,
     ):
         self.text_model_name = text_model_name
@@ -54,12 +53,12 @@ class VBertTextConfig(PretrainedConfig):
         self.hidden_size = collect_arg_in_candidates(text_config, ["hidden_size", "embed_dim"])
         self.num_hidden_layers = collect_arg_in_candidates(text_config, ["num_hidden_layers", "num_hidden_blocks"])
         self.intermediate_size = collect_arg_in_candidates(text_config, ["intermediate_size", "mlp_dim"])
-        self.mlp_bias = collect_arg_in_candidates(text_config, ["mlp_bias", "mlp_hidden_bias"], default = False)
+        self.mlp_bias = collect_arg_in_candidates(text_config, ["mlp_bias", "mlp_hidden_bias"], default = False, strict=False)
         self.vocab_size = collect_arg_in_candidates(text_config, ["vocab_size"])
     
         super().__init__(text_model_name=text_model_name, **kwargs)
 
-class VBertVisionConfig(PretrainedConfig):
+class ModernVBertVisionConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`LlamaModel`]. It is used to instantiate an LLaMA
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -74,7 +73,7 @@ class VBertVisionConfig(PretrainedConfig):
         image_size (`int`, *optional*, defaults to 384):
             The size (resolution) of each image.
     """
-    model_type = "vbert"
+    model_type = "Modernvbert"
     attribute_map = {
         "hidden_size": "embed_dim",
     }
@@ -91,14 +90,14 @@ class VBertVisionConfig(PretrainedConfig):
             vision_config = vision_config.vision_config
 
         self.embed_dim = collect_arg_in_candidates(vision_config, ["embed_dim", "hidden_size"])
-        self.image_size = collect_arg_in_candidates(vision_config, ["image_size", "img_size"])
+        self.image_size = collect_arg_in_candidates(vision_config, ["image_size", "img_size"], default=None, strict=False)
         self.patch_size = collect_arg_in_candidates(vision_config, ["patch_size"])
         self.num_hidden_layers = collect_arg_in_candidates(vision_config, ["num_hidden_layers", "num_hidden_blocks"])
         self.intermediate_size = collect_arg_in_candidates(vision_config, ["intermediate_size", "mlp_dim"])
 
         super().__init__(vision_model_name=vision_model_name, **kwargs)
 
-class VBertConfig(PretrainedConfig):
+class ModernVBertConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a [`SmolVLMModel`]. It is used to instantiate a
     SmolVLM model according to the specified arguments, defining the model architecture. Instantiating a
@@ -136,11 +135,11 @@ class VBertConfig(PretrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "vbert"
+    model_type = "modernvbert"
     is_composition = True
-    # sub_configs = {"text_config": VBertTextConfig, "vision_config": VBertVisionConfig}
+    # sub_configs = {"text_config": ModernVBertTextConfig, "vision_config": ModernVBertVisionConfig}
 
-    DEFAULT_TEXT_MODEL_NAME = "EuroBERT/EuroBERT-210m"
+    DEFAULT_TEXT_MODEL_NAME = "answerdotai/ModernBERT-base"
     DEFAULT_VISION_MODEL_NAME = "google/siglip2-base-patch16-512"
 
     def __init__(
@@ -169,13 +168,13 @@ class VBertConfig(PretrainedConfig):
         if text_config is None:
             text_config = AutoConfig.from_pretrained(self.DEFAULT_TEXT_MODEL_NAME, trust_remote_code=True)
         elif isinstance(text_config, dict):
-            text_config = VBertTextConfig(text_config["text_model_name"])
+            text_config = ModernVBertTextConfig(text_config["text_model_name"])
         self.text_config = text_config
         
         if vision_config is None:
             vision_config = AutoConfig.from_pretrained(self.DEFAULT_VISION_MODEL_NAME, trust_remote_code=True)
         elif isinstance(vision_config, dict):
-            vision_config = VBertVisionConfig(vision_config["vision_model_name"])
+            vision_config = ModernVBertVisionConfig(vision_config["vision_model_name"])
         self.vision_config = vision_config
 
         self.freeze_config = freeze_config
@@ -212,11 +211,6 @@ class VBertConfig(PretrainedConfig):
         # output["freeze_config"] = self.freeze_config.to_dict()
 
         return output
-    
-    # @classmethod
-    # def from_pretrained(cls, pretrained_model_name_or_path: Union[str, os.PathLike], **kwargs) -> "PretrainedConfig":
-    #     outputs = super(VBertConfig, cls).from_pretrained(pretrained_model_name_or_path, **kwargs)
-    #     return outputs
 
     @classmethod
     def from_pretrained_models(
@@ -227,8 +221,8 @@ class VBertConfig(PretrainedConfig):
     ) -> "PretrainedConfig":
         # text_model_config = AutoConfig.from_pretrained(text_model_name, trust_remote_code=True)
         # vision_model_config = AutoConfig.from_pretrained(vision_model_name, trust_remote_code=True)
-        text_model_config = VBertTextConfig(text_model_name)
-        vision_model_config = VBertVisionConfig(vision_model_name)
+        text_model_config = ModernVBertTextConfig(text_model_name)
+        vision_model_config = ModernVBertVisionConfig(vision_model_name)
         return cls(
             text_config=text_model_config,
             vision_config=vision_model_config,

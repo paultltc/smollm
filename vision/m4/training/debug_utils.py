@@ -1,5 +1,7 @@
 """ Trainer debug utils """
 
+import torch
+from transformers import AutoModel
 
 def dump_optim_states(self):
     """dumps basic information about the state of the optimizer"""
@@ -32,3 +34,19 @@ def validate_optim_states_are_reset(self):
             raise ValueError(f"optimizer reset didn't seem to work: state={i} step={state['exp_avg']}")
         if not all(state["exp_avg_sq"] == 0):
             raise ValueError(f"optimizer reset didn't seem to work: state={i} step={state['exp_avg_sq']}")
+
+
+def model_is_correctly_loaded_from_other(custom_model, parent_model, **kwargs):
+    parent_model = AutoModel.from_pretrained(parent_model, trust_remote_code=True, **kwargs)
+
+    if hasattr(parent_model, "vision_model"):
+        parent_model = parent_model.vision_model
+
+    # assert that all parameters woth the same name are equal
+    for name, param in custom_model.named_parameters():
+        if "embed" in name:
+            continue
+        if name not in parent_model.state_dict():
+            raise ValueError(f"parameter {name} not found in parent model")
+        if not torch.allclose(param, parent_model.state_dict()[name]):
+            raise ValueError(f"parameter {name} is not equal to the parent model")

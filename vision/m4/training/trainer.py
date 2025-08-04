@@ -17,6 +17,7 @@ import torch
 import torch.optim as torch_optim
 import transformers.optimization as transformers_optim
 import wandb
+import contextlib
 from packaging import version
 
 from m4.training.config import (
@@ -461,7 +462,6 @@ Batch sizes:
                 self.vl_model.parameters(),
                 **self.optim_param.vl_optim_params,
             )
-
         try:
             vl_scheduler_class = getattr(torch_optim.lr_scheduler, self.optim_param.vl_lr_scheduler)
         except AttributeError:
@@ -519,9 +519,9 @@ Batch sizes:
             # 1. resume
             train_logs = self.resume_param.train_logs
 
-            curr_opt_step = self.resume_param.resume_opt_step
-            curr_epoch = self.resume_param.resume_epoch
-            gbs_running = self.resume_param.gbs_running
+            self.curr_opt_step = self.resume_param.resume_opt_step
+            self.curr_epoch = self.resume_param.resume_epoch
+            self.gbs_running = self.resume_param.gbs_running
 
             # This check is necessary because the info is saved as json in the checkpoint
             # and when it is loaded back it is converted to a normal dictionary which can
@@ -544,12 +544,12 @@ Batch sizes:
         else:
             # 2. non-resume (first run)
             train_logs = self._reset_train_logs(None)
-            curr_opt_step = 0
-            curr_epoch = 0
+            self.curr_opt_step = 0
+            self.curr_epoch = 0
             opt_step_is_saved = False
             eval_is_done = False
 
-            gbs_running = GlobalBatchSizeRampUpRunningParams(
+            self.gbs_running = GlobalBatchSizeRampUpRunningParams(
                 global_seen_samples=0,
                 global_batch_size_current=self.hparams.global_batch_size,
                 next_goal_samples=self.hparams.global_batch_size_ramp_up.samples,
@@ -562,7 +562,7 @@ Batch sizes:
             # self.main_rng_seed = rng.get_state()
             # self.main_rng_seed = rng.RandomState.get_state()
 
-        self.update_gas_and_gbs(gbs_running.grad_acc_size_current, gbs_running.global_batch_size_current)
+        self.update_gas_and_gbs(self.gbs_running.grad_acc_size_current, self.gbs_running.global_batch_size_current)
 
         max_num_epochs = self.hparams.max_num_epochs
         try:
@@ -580,7 +580,7 @@ Batch sizes:
 
         if self.hparams.max_num_opt_steps_this_run is not None:
             self.max_num_updates_this_run = min(
-                max_num_updates, curr_opt_step + self.hparams.max_num_opt_steps_this_run
+                max_num_updates, self.curr_opt_step + self.hparams.max_num_opt_steps_this_run
             )
         else:
             self.max_num_updates_this_run = max_num_updates
@@ -599,11 +599,8 @@ Batch sizes:
             train_logs,
             max_num_epochs,
             max_num_updates,
-            curr_opt_step,
-            curr_epoch,
             opt_step_is_saved,
             eval_is_done,
-            gbs_running,
         )
     
     @property
@@ -611,176 +608,18 @@ Batch sizes:
         return hasattr(self.accelerator, "deepspeed_engine_wrapped")
     
     @property
-    def _sync_gradients(self):
-        return self.accelerator.sync_gradients
-
-    def _compute_batch_stats(self, batch):
-        # Use effective max_num_images per batch. ie: if the max_num_images of this batch is 3, the pixel_values and image mask are truncated accordingly.
-        # Same for max_height and max_width
-        effective_max_num_images = max(batch["num_images"])
-        if effective_max_num_images > 0:
-            images_heights = batch["pixel_attention_mask"][:, :, :, 0].sum(dim=-1)
-            images_widths = batch["pixel_attention_mask"][:, :, 0].sum(dim=-1)
-            effective_max_height = images_heights.max().int()
-            effective_max_width = images_widths.max().int()
-            batch["pixel_values"] = batch["pixel_values"][
-                :, :effective_max_num_images, :, :effective_max_height, :effective_max_width
-            ]
-            batch["pixel_attention_mask"] = batch["pixel_attention_mask"][
-                :, :effective_max_num_images, :effective_max_height, :effective_max_width
-            ]
-        else:
-            # This case is a security check: if there are no images, then it should not appear in `batch` in the first place
-            batch.pop("pixel_values", None)
-            batch.pop("pixel_attention_mask", None)
-
-        effective_max_num_tokens = max(batch["attention_mask"].sum(dim=-1))
-        batch["input_ids"] = batch["input_ids"][:, :effective_max_num_tokens]
-        if "labels" in batch:
-            batch["labels"] = batch["labels"][:, :effective_max_num_tokens]
-        batch["attention_mask"] = batch["attention_mask"][:, :effective_max_num_tokens]
-
-        batch = accelerate.utils.operations.send_to_device(batch, self.accelerator.device)
-
-        num_images = batch["num_images"].sum()
-        num_image_tokens = (batch["input_ids"] == self.image_token_id).sum()
-        num_text_tokens = batch["num_text_tokens"].sum()
-        total_tokens = batch["attention_mask"].numel()
-        num_padding = total_tokens - batch["attention_mask"].sum()
-        if "pixel_values" in batch:
-            pixel_values_sum = batch["pixel_values"].sum()
-        else:
-            pixel_values_sum = torch.tensor(0.0, device=self.accelerator.device)
-        image_to_text_ratio = torch.div(num_images, num_text_tokens)
-
-        return (
-            effective_max_num_images,
-            effective_max_num_tokens,
-            num_images,
-            num_image_tokens,
-            num_text_tokens,
-            total_tokens,
-            num_padding,
-            pixel_values_sum,
-            image_to_text_ratio,
-        )
+    def do_sync_gradients(self):
+        # return self.accelerator.sync_gradients
+        return self.curr_opt_step % self.hparams.grad_acc_size == 0
     
-    def _compute_losses(self, outputs, batch, dataset_idx):
-        per_token_loss = outputs.loss
-
-        if self.hparams.loss_weights_per_dataset is not None:
-            per_token_loss *= self.hparams.loss_weights_per_dataset[dataset_idx]
-        if self.optim_param.z_loss > 0.0:
-            logits = outputs.logits
-            attention_mask = batch["attention_mask"] * (batch["input_ids"] != self.image_token_id).long()
-            log_z = torch.logsumexp(logits, dim=-1) * attention_mask
-            z_loss = log_z**2
-            z_loss = z_loss.sum() / attention_mask.sum()
-            combined_loss = per_token_loss + self.optim_param.z_loss * z_loss
-        else:
-            z_loss = torch.tensor(0.0, device=self.accelerator.device)
-            combined_loss = per_token_loss
-
-        return per_token_loss, z_loss, combined_loss
-    
-    def _opt_step(self, step):
-        if self._sync_gradients:
-            self.accelerator.clip_grad_norm_(self.vl_model.parameters(), self.hparams.grad_clip)
-
-            if (
-                len(self.hparams.train_logging_grad_param_deepspeed) != 0
-                and (step + 1) % self.hparams.train_logging_grad_param_deepspeed_opt_steps == 0
-            ):
-                self._log_deepspeed_training_stats(curr_opt_step=step)
-
-        if self._is_deepspeed_enabled:
-            self.accelerator.deepspeed_engine_wrapped.engine.step()
-
-        self.vl_optim.step()
-
-        # 1. sync_gradients is used for this dirty trick: https://github.com/huggingface/m4/pull/386
-        # 2. since we don't accelerate prepare the lr scheduler we need to manually skip it if
-        # optimizer skipped (otherwise accelerate would do that for us)
-        if self._sync_gradients and not self.accelerator.optimizer_step_was_skipped:
-            self.vl_scheduler.step()
-
-        self.vl_optim.zero_grad(set_to_none=True)
-
-    def _bwd_pass(self, loss):
-        # accelerate's deepspeed `backward` calls `engine.step`, which is a problem if we want
-        # to investigate things before step, so override with just a backward call and then call
-        # `engine.step` along with `optim.step` a bit lower
-        if self._is_deepspeed_enabled:
-            self.accelerator.deepspeed_engine_wrapped.engine.backward(loss)
-        else:
-            self.accelerator.backward(loss)
-
-    def _do_batch(self, batch, curr_opt_step, dataset_name=None, dataset_idx=None, validation=False):
-        # Get batch stats
-        (
-            effective_max_num_images,
-            effective_max_num_tokens,
-            num_images,
-            num_image_tokens,
-            num_text_tokens,
-            total_tokens,
-            num_padding,
-            pixel_values_sum,
-            image_to_text_ratio,
-        ) = self._compute_batch_stats(batch)
-
-
-        # Forward pass
-        vl_output = self.vl_model(
-            input_ids=batch["input_ids"],
-            attention_mask=batch["attention_mask"],
-            pixel_values=batch["pixel_values"] if "pixel_values" in batch else None,
-            pixel_attention_mask=batch["pixel_attention_mask"] if "pixel_attention_mask" in batch else None,
-            labels=batch["labels"] if "labels" in batch else batch["input_ids"],
-        )
-
-        if validation:
-            return (
-                vl_output.loss,
-                num_images,
-                num_text_tokens,
-                image_to_text_ratio,
-                num_padding,
-                pixel_values_sum,
-            )
-        
-        # Compute loss
-        (
-            per_token_loss, 
-            z_loss, 
-            combined_loss
-        ) = self._compute_losses(vl_output, batch, dataset_idx)
-
-        self._bwd_pass(loss=combined_loss)
-        self._opt_step(step=curr_opt_step)
-
-        tflops_per_batch_per_gpu = self.vl_model.get_model_tflops_per_batch_per_gpu(
-            hparams=self.hparams,
-            data_param=getattr(self.data_param, dataset_name),
-            tokenizer=self.tokenizer,
-            max_num_images=effective_max_num_images,
-            max_num_tokens=effective_max_num_tokens,
-        ).to(self.accelerator.device)
-
-        # Reset batch
+    @property
+    def _should_log_deepspeed_training_stats(self):
         return (
-            per_token_loss,
-            z_loss,
-            num_images,
-            num_image_tokens,
-            num_text_tokens,
-            image_to_text_ratio,
-            num_padding,
-            pixel_values_sum,
-            tflops_per_batch_per_gpu,
+            len(self.hparams.train_logging_grad_param_deepspeed) != 0
+            and (self.curr_opt_step + 1) % self.hparams.train_logging_grad_param_deepspeed_opt_steps == 0
         )
 
-    def _log_deepspeed_training_stats(self, curr_opt_step):
+    def _log_deepspeed_training_stats(self):
         if self.hparams.job_id is not None:
             log_stats_file = self.hparams.save_dir / "logs" / f"{self.hparams.job_id}_logs_params_grads_stats.jsonl"
         else:
@@ -837,7 +676,11 @@ Batch sizes:
                     f.write(json.dumps(grad_param_logs) + "\n")
 
             if LoggingTypes.WANDB in self.hparams.train_logging_grad_param_deepspeed and self.hparams.wandb_enable:
-                self.accelerator.log({**grad_param_logs, **self._get_additional_step_logs()}, step=curr_opt_step + 1)
+                self.accelerator.log(
+                    {
+                        **grad_param_logs,
+                        **self._get_additional_step_logs()
+                    }, step=self.curr_opt_step + 1)
 
             if LoggingTypes.PRINT in self.hparams.train_logging_grad_param_deepspeed:
                 log = "Grads and params stats: "
@@ -897,8 +740,6 @@ Batch sizes:
 
     def _update_logs(
         self,
-        curr_opt_step,
-        curr_epoch,
         global_batch_size_current,
         train_logs,
         per_token_loss,
@@ -1021,14 +862,14 @@ Batch sizes:
                     train_logs["tflop_counter"][ds_name] / train_logs["fwd_bwd_time"][ds_name]
                 )
 
-        train_logs["num_batches_since_training_logged"]["all"] += 1
-        train_logs["num_batches"]["all"] += 1
-        train_logs["num_batches_in_curr_epoch"]["all"] += 1
+        train_logs["num_batches_since_training_logged"]["all"] += self.accelerator.num_processes
+        train_logs["num_batches"]["all"] += self.accelerator.num_processes
+        train_logs["num_batches_in_curr_epoch"]["all"] += self.accelerator.num_processes
 
         train_logs["lr"] = self.vl_scheduler.get_last_lr()[0]
 
-        train_logs["num_opt_steps"] = curr_opt_step
-        train_logs["num_epochs"] = curr_epoch
+        train_logs["num_opt_steps"] = self.curr_opt_step
+        train_logs["num_epochs"] = self.curr_epoch
         train_logs["global_batch_size_current"] = global_batch_size_current
 
         return train_logs
@@ -1156,7 +997,7 @@ Batch sizes:
         else:
             raise ValueError(f"Unknown logger type: {logger_type}")
 
-    def _log_training(self, curr_opt_step, train_task, train_logs):
+    def _log_training(self, train_task, train_logs):
         for key in train_logs["per_token_loss_acc"].keys():
             if train_logs["num_per_device_batches_since_training_logged"][key] is not None:
                 train_logs["per_token_loss"][key] = (
@@ -1231,12 +1072,12 @@ Batch sizes:
                 for k, v in filtered_train_logs.items():
                     if isinstance(v, dict):
                         filtered_train_logs[k] = {k2: v2 for k2, v2 in v.items() if v2 is not None}
-                self.accelerator.log({**filtered_train_logs, **self._get_additional_step_logs()}, step=curr_opt_step)
+                self.accelerator.log({**filtered_train_logs, **self._get_additional_step_logs()}, step=self.curr_opt_step)
 
         train_logs = self._reset_train_logs(train_logs)
         return train_logs
 
-    def _log_activations(self, curr_opt_step):
+    def _log_activations(self):
         if not self.activation_tracker.jsonl_stats:
             return
 
@@ -1248,15 +1089,15 @@ Batch sizes:
             else:
                 log_activations_filename = self.hparams.save_dir / "logs" / "logs_activations.jsonl"
 
-            self.activation_tracker.dump_stats(log_activations_filename, curr_opt_step=curr_opt_step)
+            self.activation_tracker.dump_stats(log_activations_filename)
 
         # if LoggingTypes.WANDB in self.hparams.train_logging_activations and self.hparams.wandb_enable:
         #     for stats in self.activation_tracker.jsonl_stats:
-        #         self.accelerator.log({**stats, **self._get_additional_step_logs()}, step=curr_opt_step)
+        #         self.accelerator.log({**stats, **self._get_additional_step_logs()}, step=self.curr_opt_step)
 
         if LoggingTypes.PRINT in self.hparams.train_logging_activations:
             for stats in self.activation_tracker.jsonl_stats:
-                stats["step"] = curr_opt_step
+                stats["step"] = self.curr_opt_step
                 activation_format = {
                     k: "" if ("nonzero" in k or "step" in k or "name" in k or "type" in k or "batches" in k) else "e"
                     for k in stats.keys()
@@ -1271,7 +1112,7 @@ Batch sizes:
         if self.hparams.kill_switch_path is not None and self.hparams.kill_switch_path.exists():
             self.kill_switch_activated = True
 
-    def _check_jz_time_and_memory(self, curr_opt_step):
+    def _check_jz_time_and_memory(self):
         # From https://github.com/wandb/wandb/blob/9c777265f8cea1eaeb0407dd37ab889aeea81114/wandb/sdk/internal/stats.py#L263
         if self.accelerator.is_local_main_process:
             self.memory_value = torch.tensor(psutil.virtual_memory().percent).to(self.accelerator.device)
@@ -1291,7 +1132,7 @@ Batch sizes:
 
         if self.accelerator.is_main_process and self.hparams.wandb_enable:
             system_metrics_logs = self._get_system_metrics_logs(memory_value_max)
-            self.accelerator.log({**system_metrics_logs, **self._get_additional_step_logs()}, step=curr_opt_step)
+            self.accelerator.log({**system_metrics_logs, **self._get_additional_step_logs()}, step=self.curr_opt_step)
 
     def _check_sigterm_signal(self):
         if self.sigterm_listener.kill_now:
@@ -1300,14 +1141,11 @@ Batch sizes:
     def _save(
         self,
         train_logs,
-        curr_opt_step,
-        curr_epoch,
-        gbs_running,
     ):
         self.accelerator.wait_for_everyone()
 
         # create directory and file names
-        self.last_opt_step_dir = self.hparams.save_dir / f"opt_step-{curr_opt_step}"
+        self.last_opt_step_dir = self.hparams.save_dir / f"opt_step-{self.curr_opt_step}"
         # Make directory for this step
         self.last_opt_step_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1357,10 +1195,13 @@ Batch sizes:
                 "train_logs": train_logs,
                 "wandb_run_id": self.hparams.wandb_run_id,
                 "seed": self.hparams.seed,
-                "resume_opt_step": curr_opt_step,
-                "resume_epoch": curr_epoch,
-                "gbs_running": gbs_running,
+                "resume_opt_step": self.curr_opt_step,
+                "resume_epoch": self.curr_epoch,
+                "gbs_running": self.gbs_running,
             }
+
+            if self.gbs_running.next_goal_samples is None:
+                self.gbs_running.next_goal_samples = 0
 
             with open(self.last_opt_step_dir / "resume_run_infos.json", "w") as fp:
                 # json.dump(data, fp, indent=2)
@@ -1398,7 +1239,7 @@ Batch sizes:
                 os.path.split(self.hparams.save_dir)[0],
                 os.path.split(self.hparams.save_dir)[1],
                 previous_to_last_folder,
-                "opt_step-" + str(curr_opt_step),
+                "opt_step-" + str(self.curr_opt_step),
             )
             subprocess.Popen(cmd, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
@@ -1409,9 +1250,9 @@ Batch sizes:
         with open(dir_path / f"batch_idx_{curr_idx}_proc_{self.accelerator.process_index}.pkl", "wb") as file:
             pickle.dump(batch, file)
 
-    def _check_if_training_is_over(self, curr_opt_step, max_num_updates):
+    def _check_if_training_is_over(self, max_num_updates):
         self._check_kill_switch()
-        self._check_jz_time_and_memory(curr_opt_step=curr_opt_step)
+        self._check_jz_time_and_memory()
         self._check_sigterm_signal()
 
         finished_training = True
@@ -1424,9 +1265,9 @@ Batch sizes:
             logger.info("** Training time is over **")
         elif self.memory_explosion:
             logger.info("** CPU memory is close to explosion. Please restart training **")
-        elif curr_opt_step >= max_num_updates:
+        elif self.curr_opt_step >= max_num_updates:
             logger.info("** Maximum number of steps has been reached for this training **")
-        elif curr_opt_step >= self.max_num_updates_this_run:
+        elif self.curr_opt_step >= self.max_num_updates_this_run:
             logger.info("** Maximum number of steps has been reached for this run **")
         else:
             finished_training = False
@@ -1435,19 +1276,16 @@ Batch sizes:
 
     def _check_if_training_is_over_and_maybe_save_model(
         self,
-        curr_opt_step,
-        curr_epoch,
-        gbs_running,
         max_num_updates,
         train_logs,
         opt_step_is_saved,
     ):
         # check if should finish the training
-        finished_training = self._check_if_training_is_over(curr_opt_step, max_num_updates)
+        finished_training = self._check_if_training_is_over(max_num_updates)
 
         # save the model
         # 1. either because it's a scheduled saving
-        is_opt_to_save_model = curr_opt_step != 0 and curr_opt_step % self.hparams.train_saving_opt_steps == 0
+        is_opt_to_save_model = self.curr_opt_step != 0 and self.curr_opt_step % self.hparams.train_saving_opt_steps == 0
         # 2. it was requested via the save switch
         if self.hparams.save_switch_path is not None and self.hparams.save_switch_path.exists():
             is_opt_to_save_model = True
@@ -1457,9 +1295,6 @@ Batch sizes:
         if not opt_step_is_saved and (finished_training or is_opt_to_save_model):
             self._save(
                 train_logs,
-                curr_opt_step,
-                curr_epoch,
-                gbs_running,
             )
             opt_step_is_saved = True
 
@@ -1501,14 +1336,14 @@ Batch sizes:
         )
         return train_logs
 
-    def _do_validation(self, progress, curr_opt_step):
+    def _do_validation(self, progress):
         try:
             val_len = len(self.val_loader)
         except TypeError:
             val_len = None
         self.vl_model.eval()
         val_loop = progress.add_task(
-            f"[cyan]Validation step-{curr_opt_step}",
+            f"[cyan]Validation step-{self.curr_opt_step}",
             disable=not self.accelerator.is_main_process,
             total=val_len,
             visible=False,
@@ -1534,7 +1369,10 @@ Batch sizes:
                     curr_val_image_to_text_ratio,
                     curr_val_num_padding,
                     _,
-                ) = self._do_batch(batch, curr_opt_step, validation=True)
+                ) = self.validation_step(
+                    batch,
+                    dataset_name,
+                )
 
             val_per_token_loss_acc["all"] += curr_val_per_token_loss
             val_num_images["all"] += curr_val_num_images
@@ -1557,7 +1395,7 @@ Batch sizes:
             ):
                 logger.info(
                     "Validation"
-                    f" step-{curr_opt_step} state:{TaskProgressColumn().render(curr_val_task)} Time"
+                    f" step-{self.curr_opt_step} state:{TaskProgressColumn().render(curr_val_task)} Time"
                     f" Elapsed: {TimeElapsedColumn().render(curr_val_task)} Steps"
                     f" Completed:{MofNCompleteColumn().render(curr_val_task)}"
                 )
@@ -1575,7 +1413,6 @@ Batch sizes:
     def _log_validation(
         self,
         val_steps,
-        curr_opt_step,
         val_per_token_loss_acc,
         val_num_images,
         val_num_tokens,
@@ -1647,7 +1484,7 @@ Batch sizes:
         }
         if self.accelerator.is_main_process:
             print(f"Validation logs: {self.format_val_logs(val_logs, LoggingTypes.PRINT)}")
-            jsonl_logs = {"current step": curr_opt_step, "set": "validation"}
+            jsonl_logs = {"current step": self.curr_opt_step, "set": "validation"}
             jsonl_logs.update(self.format_val_logs(val_logs, LoggingTypes.JSONL))
 
             if self.hparams.job_id is not None:
@@ -1659,7 +1496,216 @@ Batch sizes:
                 f.write(json.dumps(jsonl_logs) + "\n")
 
             if self.hparams.wandb_enable:
-                self.accelerator.log({**val_logs, **self._get_additional_step_logs()}, step=curr_opt_step)
+                self.accelerator.log({**val_logs, **self._get_additional_step_logs()}, step=self.curr_opt_step)
+
+    def _prepare_batch(self, batch):
+        """
+        Prepare batch for training.
+        This includes:
+        - Truncating the pixel_values and pixel_attention_mask to the effective max_num_images
+        - Truncating the input_ids, attention_mask and labels to the effective max_num_tokens
+        - Sending the batch to the device
+        """
+        # Use effective max_num_images per batch. ie: if the max_num_images of this batch is 3, the pixel_values and image mask are truncated accordingly.
+        # Same for max_height and max_width
+        effective_max_num_images = max(batch["num_images"])
+        if effective_max_num_images > 0:
+            images_heights = batch["pixel_attention_mask"][:, :, :, 0].sum(dim=-1)
+            images_widths = batch["pixel_attention_mask"][:, :, 0].sum(dim=-1)
+            effective_max_height = images_heights.max().int()
+            effective_max_width = images_widths.max().int()
+            batch["pixel_values"] = batch["pixel_values"][
+                :, :effective_max_num_images, :, :effective_max_height, :effective_max_width
+            ]
+            batch["pixel_attention_mask"] = batch["pixel_attention_mask"][
+                :, :effective_max_num_images, :effective_max_height, :effective_max_width
+            ]
+        else:
+            # This case is a security check: if there are no images, then it should not appear in `batch` in the first place
+            batch.pop("pixel_values", None)
+            batch.pop("pixel_attention_mask", None)
+
+        effective_max_num_tokens = max(batch["attention_mask"].sum(dim=-1))
+        batch["input_ids"] = batch["input_ids"][:, :effective_max_num_tokens]
+        if "labels" in batch:
+            batch["labels"] = batch["labels"][:, :effective_max_num_tokens]
+        else:
+            batch["labels"] = batch["input_ids"].clone()
+        batch["attention_mask"] = batch["attention_mask"][:, :effective_max_num_tokens]
+
+        batch = accelerate.utils.operations.send_to_device(batch, self.accelerator.device)
+
+        return batch
+    
+
+    def _compute_batch_stats(self, batch):
+        """
+        Compute batch stats for training.
+        This includes:
+        - num_images
+        - num_text_tokens
+        - image_to_text_ratio
+        - num_padding
+        - pixel_values_sum
+        """
+        effective_max_num_images = max(batch["num_images"])
+        effective_max_num_tokens = max(batch["attention_mask"].sum(dim=-1))
+        num_images = batch["num_images"].sum()
+        num_image_tokens = (batch["input_ids"] == self.image_token_id).sum()
+        num_text_tokens = batch["num_text_tokens"].sum()
+        total_tokens = batch["attention_mask"].numel()
+        num_padding = total_tokens - batch["attention_mask"].sum()
+        if "pixel_values" in batch:
+            pixel_values_sum = batch["pixel_values"].sum()
+        else:
+            pixel_values_sum = torch.tensor(0.0, device=self.accelerator.device)
+        image_to_text_ratio = torch.div(num_images, num_text_tokens)
+
+        return (
+            effective_max_num_images,
+            effective_max_num_tokens,
+            num_images,
+            num_image_tokens,
+            num_text_tokens,
+            image_to_text_ratio,
+            num_padding,
+            pixel_values_sum,
+        )
+
+    def _forward_pass(self, batch, dataset_idx=None):
+        """Do forward pass on vl model and compute losses for training."""
+        # Forward pass
+        vl_output = self.vl_model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            pixel_values=batch.get("pixel_values", None),
+            pixel_attention_mask=batch.get("pixel_attention_mask", None),
+            labels=batch["labels"],
+        )
+
+        per_token_loss = vl_output.loss
+
+        if self.hparams.loss_weights_per_dataset is not None and dataset_idx is not None:
+            per_token_loss *= self.hparams.loss_weights_per_dataset[dataset_idx]
+        if self.optim_param.z_loss > 0.0:
+            logits = vl_output.logits
+            attention_mask = batch["attention_mask"] * (1 - (batch["input_ids"] == self.image_token_id).long())
+            log_z = torch.logsumexp(logits, dim=-1) * attention_mask
+            z_loss = log_z**2
+            z_loss = z_loss.sum() / attention_mask.sum()
+            combined_loss = per_token_loss + self.optim_param.z_loss * z_loss
+        else:
+            z_loss = torch.tensor(0.0, device=self.accelerator.device)
+            combined_loss = per_token_loss
+
+        return (
+            per_token_loss, 
+            combined_loss,
+            z_loss
+        )
+
+    def train_step(self, batch, dataset_name=None, dataset_idx=None):
+        """Do a training step on the vl model."""
+        # Prepare batch
+        batch = self._prepare_batch(batch)
+
+        # Compute batch stats
+        (
+            effective_max_num_images,
+            effective_max_num_tokens,
+            num_images,
+            num_image_tokens,
+            num_text_tokens,
+            image_to_text_ratio,
+            num_padding,
+            pixel_values_sum,
+        ) = self._compute_batch_stats(batch)
+
+        # Forward pass
+        per_token_loss, combined_loss, z_loss = self._forward_pass(batch, dataset_idx=dataset_idx)
+
+        # Backward pass
+        self.accelerator.backward(combined_loss)
+
+        self.accelerator.clip_grad_norm_(self.vl_model.parameters(), self.hparams.grad_clip)
+        if self._should_log_deepspeed_training_stats:
+            self._log_deepspeed_training_stats()
+
+        # Optimizer step
+        self.vl_optim.step()
+
+        if self.accelerator.sync_gradients:
+            self.vl_scheduler.step()
+        
+        self.vl_optim.zero_grad(set_to_none=True)
+
+
+        # Compute tflops
+        tflops_per_batch_per_gpu = self.vl_model.get_model_tflops_per_batch_per_gpu(
+            hparams=self.hparams,
+            data_param=getattr(self.data_param, dataset_name),
+            tokenizer=self.tokenizer,
+            max_num_images=effective_max_num_images,
+            max_num_tokens=effective_max_num_tokens,
+        ).to(self.accelerator.device)
+        
+        return (
+            per_token_loss,
+            z_loss,
+            num_images,
+            num_image_tokens,
+            num_text_tokens,
+            image_to_text_ratio,
+            num_padding,
+            pixel_values_sum,
+            tflops_per_batch_per_gpu,
+        )
+    
+    def validation_step(self, batch, dataset_name=None):
+        """Do a validation step on the vl model."""
+        # Prepare batch
+        batch = self._prepare_batch(batch)
+
+        # Compute batch stats
+        (
+            effective_max_num_images,
+            effective_max_num_tokens,
+            num_images,
+            num_image_tokens,
+            num_text_tokens,
+            image_to_text_ratio,
+            num_padding,
+            pixel_values_sum,
+        ) = self._compute_batch_stats(batch)
+
+        # Forward pass
+        vl_output = self.vl_model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            pixel_values=batch.get("pixel_values", None),
+            pixel_attention_mask=batch.get("pixel_attention_mask", None),
+            labels=batch["labels"],
+        )
+
+        # Compute tflops
+        tflops_per_batch_per_gpu = self.vl_model.get_model_tflops_per_batch_per_gpu(
+            hparams=self.hparams,
+            data_param=getattr(self.data_param, dataset_name),
+            tokenizer=self.tokenizer,
+            max_num_images=effective_max_num_images,
+            max_num_tokens=effective_max_num_tokens,
+        ).to(self.accelerator.device)
+        
+        return (
+            vl_output.loss,
+            num_images,
+            num_image_tokens,
+            num_text_tokens,
+            image_to_text_ratio,
+            num_padding,
+            pixel_values_sum,
+            tflops_per_batch_per_gpu,
+        )
 
     def train(self, maybe_torch_profile_scheduler=None):
         # timing_break_down = self.accelerator.is_main_process and self.hparams.timing_break_down
@@ -1676,11 +1722,8 @@ Batch sizes:
             train_logs,
             max_num_epochs,
             max_num_updates,
-            curr_opt_step,
-            curr_epoch,
             opt_step_is_saved,
             eval_is_done,
-            gbs_running,
         ) = self._set_up_training()
 
         # --------------------
@@ -1693,7 +1736,7 @@ Batch sizes:
                 "[red]Training", disable=not self.accelerator.is_main_process, total=max_num_updates, visible=False
             )
             train_task = progress.tasks[-1]
-            progress.update(progress_bar, advance=curr_opt_step)
+            progress.update(progress_bar, advance=self.curr_opt_step)
             finished_training = False
             training_logged = True
             timer = DeviceAgnosticTimer()
@@ -1706,7 +1749,7 @@ Batch sizes:
                     time_deltas = {}
 
             while not finished_training:
-                self.train_loader.set_epoch(curr_epoch)
+                self.train_loader.set_epoch(self.curr_epoch)
 
                 # Handle resume based on `realtime_processing`
                 if self.hparams.resume_run:
@@ -1747,9 +1790,6 @@ Batch sizes:
                             time_deltas["dl"] = timer2.delta()
 
                     finished_training, opt_step_is_saved = self._check_if_training_is_over_and_maybe_save_model(
-                        curr_opt_step,
-                        curr_epoch,
-                        gbs_running,
                         max_num_updates,
                         train_logs,
                         opt_step_is_saved,
@@ -1760,10 +1800,10 @@ Batch sizes:
                     # --------------------
                     # Activate/deactivate hooks for logging activations or not
                     # --------------------
-                    # We are logging everything at `curr_opt_step`, but `curr_opt_step` is incremented a few lines later, so activating
-                    # the activation tracking hooks based on `curr_opt_step + 1`. See `_log_activations` for more details.
+                    # We are logging everything at `self.curr_opt_step`, but `self.curr_opt_step` is incremented a few lines later, so activating
+                    # the activation tracking hooks based on `self.curr_opt_step + 1`. See `_log_activations` for more details.
                     if self.activation_tracker:
-                        if (curr_opt_step + 1) % self.hparams.train_logging_activations_opt_steps == 0 and (
+                        if (self.curr_opt_step + 1) % self.hparams.train_logging_activations_opt_steps == 0 and (
                             curr_idx + 1
                         ) % self.hparams.grad_acc_size == 0:
                             self.activation_tracker.activate_hooks()
@@ -1796,12 +1836,10 @@ Batch sizes:
                             num_padding,
                             pixel_values_sum,
                             tflops_per_batch_per_gpu,
-                        ) = self._do_batch(
+                        ) = self.train_step(
                             batch,
-                            curr_opt_step=curr_opt_step,
                             dataset_name=dataset_name,
                             dataset_idx=dataset_idx,
-                            validation=False,
                         )
 
                     # right after fwd-bwd-step
@@ -1819,7 +1857,7 @@ Batch sizes:
                     )
 
                     if (curr_idx + 1) % self.hparams.grad_acc_size == 0:
-                        curr_opt_step += 1
+                        self.curr_opt_step += 1
                         opt_step_is_saved, eval_is_done, training_logged = False, False, False
                         progress.update(progress_bar, advance=1)
 
@@ -1827,9 +1865,7 @@ Batch sizes:
                     # Update logs
                     # --------------------
                     train_logs = self._update_logs(
-                        curr_opt_step,
-                        curr_epoch,
-                        gbs_running.global_batch_size_current,
+                        self.gbs_running.global_batch_size_current,
                         train_logs,
                         per_token_loss,
                         z_loss,
@@ -1855,8 +1891,8 @@ Batch sizes:
                     # --------------------
                     # Log training infos
                     # --------------------
-                    if curr_opt_step % self.hparams.train_logging_opt_steps == 0 and not training_logged:
-                        train_logs = self._log_training(curr_opt_step, train_task, train_logs)
+                    if self.curr_opt_step % self.hparams.train_logging_opt_steps == 0 and not training_logged:
+                        train_logs = self._log_training(train_task, train_logs)
                         training_logged = True
 
                     # --------------------
@@ -1865,8 +1901,8 @@ Batch sizes:
                     if self.activation_tracker:
                         batch_idx = train_logs["num_batches"]["all"]
                         self.activation_tracker.fill_in_batch_idx(batch_idx=batch_idx)
-                        if curr_opt_step % self.hparams.train_logging_activations_opt_steps == 0:
-                            self._log_activations(curr_opt_step=curr_opt_step)
+                        if self.curr_opt_step % self.hparams.train_logging_activations_opt_steps == 0:
+                            self._log_activations()
 
                     # ---------------------------
                     # Global batch size ramp up
@@ -1875,31 +1911,28 @@ Batch sizes:
                     # This logic needs to happen after the batch has been processed and results
                     # logged, but before the model is saved for resume, so that the updated ramup up
                     # variables will have the correct values on resume
-                    gbs_running.global_seen_samples += self.accelerator.num_processes * self.hparams.batch_size_per_gpu
+                    self.gbs_running.global_seen_samples += self.accelerator.num_processes * self.hparams.batch_size_per_gpu
                     if (
                         self.hparams.global_batch_size_ramp_up.start is not None
-                        and self.hparams.global_batch_size_ramp_up.finish > gbs_running.global_batch_size_current
-                        and gbs_running.global_seen_samples >= gbs_running.next_goal_samples
+                        and self.hparams.global_batch_size_ramp_up.finish > self.gbs_running.global_batch_size_current
+                        and self.gbs_running.global_seen_samples >= self.gbs_running.next_goal_samples
                     ):
-                        gbs_running.next_goal_samples += self.hparams.global_batch_size_ramp_up.samples
+                        self.gbs_running.next_goal_samples += self.hparams.global_batch_size_ramp_up.samples
 
-                        gbs_running.global_batch_size_current += self.hparams.global_batch_size_ramp_up.increment
-                        gbs_running.grad_acc_size_current = int(
-                            gbs_running.global_batch_size_current
+                        self.gbs_running.global_batch_size_current += self.hparams.global_batch_size_ramp_up.increment
+                        self.gbs_running.grad_acc_size_current = int(
+                            self.gbs_running.global_batch_size_current
                             / (self.hparams.batch_size_per_gpu * self.accelerator.num_processes)
                         )
 
                         self.update_gas_and_gbs(
-                            gbs_running.grad_acc_size_current, gbs_running.global_batch_size_current
+                            self.gbs_running.grad_acc_size_current, self.gbs_running.global_batch_size_current
                         )
 
                     # --------------------
                     # Check if the training is over and if so may be save the model before validation
                     # --------------------
                     finished_training, opt_step_is_saved = self._check_if_training_is_over_and_maybe_save_model(
-                        curr_opt_step,
-                        curr_epoch,
-                        gbs_running,
                         max_num_updates,
                         train_logs,
                         opt_step_is_saved,
@@ -1920,8 +1953,8 @@ Batch sizes:
                     if (
                         self.config.hparams.do_validation
                         and not eval_is_done
-                        and curr_opt_step != 0
-                        and curr_opt_step % self.hparams.val_logging_opt_steps == 0
+                        and self.curr_opt_step != 0
+                        and self.curr_opt_step % self.hparams.val_logging_opt_steps == 0
                     ):
                         if self.hparams.timing_break_down:
                             self.accelerator.wait_for_everyone()
@@ -1942,14 +1975,13 @@ Batch sizes:
                             val_num_tokens,
                             val_image_to_text_ratio,
                             val_num_padding,
-                        ) = self._do_validation(progress, curr_opt_step)
+                        ) = self._do_validation(progress, self.curr_opt_step)
 
                         # --------------------
                         # Log validation infos
                         # --------------------
                         self._log_validation(
                             val_steps,
-                            curr_opt_step,
                             val_per_token_loss_acc,
                             val_num_images,
                             val_num_tokens,
@@ -1999,17 +2031,14 @@ Batch sizes:
                         maybe_torch_profile_scheduler.step()
 
                 if not finished_training:
-                    curr_epoch += 1
+                    self.curr_epoch += 1
                     train_logs = self._end_of_epoch_reset_train_logs(train_logs)
 
                     self.train_loader.reset_state()
 
-                if curr_epoch == max_num_epochs:
+                if self.curr_epoch == max_num_epochs:
                     self._save(
                         train_logs,
-                        curr_opt_step,
-                        curr_epoch,
-                        gbs_running,
                     )
                     finished_training = True
                     logger.info("** Maximum number of epochs has been reached **")

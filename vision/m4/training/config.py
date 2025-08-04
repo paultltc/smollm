@@ -69,7 +69,6 @@ class Hparams:
     # --------------------
     # General parameters
     # --------------------
-
     seed: int = 13
     # If set to True, the sole purpose of the job is to pre-process the dataset (i.e. the map
     # operations). The job will exit as soon as the dataset is pre-processed.
@@ -231,12 +230,8 @@ class Hparams:
     def model_type(self):
         return self.model_name
 
-    @property
-    def model_classes(self) -> Tuple[PretrainedConfig, PreTrainedModel]:
-        return model_name_to_classes(self.model_type)
-
     def get_model_classes(self) -> Tuple[PretrainedConfig, PreTrainedModel]:
-        return self.model_classes
+        return model_name_to_classes(self.model_type)
 
     def get_tokenizer(self, model_vocab_size: int) -> PreTrainedTokenizer:
         return get_tokenizer(
@@ -317,7 +312,7 @@ class DatasetParams:
     max_image_size: int = 384
 
     # Parameter has to be set later once the vision_config is known.
-    vision_encoder_max_image_size: int = 0
+    vision_encoder_max_image_size: int = None
 
     def __post_init__(self):
         # Parse paths
@@ -591,10 +586,6 @@ class Parameters(Serializable):
             LoggingTypes(val) for val in self.hparams.train_logging_grad_param_deepspeed
         ]
 
-        if self.hparams.save_dir is not None:
-            # make dir if needed
-            self.hparams.save_dir.mkdir(parents=True, exist_ok=True)
-
         # Resume run if there is already an existing folder for this run
         if self.hparams.save_dir is not None and self.hparams.save_dir.exists():
             save_dir_has_checkpoints = (
@@ -608,7 +599,10 @@ class Parameters(Serializable):
                     " checkpoints of a potentially brand new experiment. Would it make sense to create a new"
                     " `save_dir`?"
                 )
-            self.hparams.resume_run = save_dir_has_checkpoints
+            if self.hparams.resume_run is None:
+                self.hparams.resume_run = save_dir_has_checkpoints
+        # else:
+        #     self.hparams.resume_run = False
 
         # Setup all args needed to resume a run
         if self.hparams.resume_run:
@@ -620,9 +614,11 @@ class Parameters(Serializable):
                 )
             if self.resume_param.resume_last:
                 if self.resume_param.opt_step_dir is not None:
-                    raise ValueError(
-                        "`resume_last` cannot be True while `opt_step_dir` is not None. Choose which dir you want to"
-                        " resume from..."
+                    logger.warning(
+                        "`resume_last` is True, but `opt_step_dir` is not None. This means that the program will"
+                        " ignore the `opt_step_dir` and resume from the last checkpoint in the `save_dir`."
+                        " If this is not what you want, please set `resume_last` to False and set `opt_step_dir` to the"
+                        " directory you want to resume from."
                     )
                 latest_path = self.hparams.save_dir / "latest_opt_step_dir"
                 with open(latest_path, "r") as fd:
@@ -697,17 +693,14 @@ class Parameters(Serializable):
                 config_file_name = "config.yaml"
             self.save(self.hparams.save_dir / config_file_name)
 
-    def get_model_classes(self) -> Tuple[PretrainedConfig, PreTrainedModel]:
-        return self.hparams.get_model_classes()
-
-    def get_tokenizer(self, model_vocab_size: int) -> PreTrainedTokenizer:
-        return self.hparams.get_tokenizer(model_vocab_size=model_vocab_size)
-
     def load_model(self, torch_dtype) -> PreTrainedModel:
-        config_class, model_class = self.get_model_classes()
+        config_class, model_class = self.hparams.get_model_classes()
 
         # we want the target dtype in order to load the model is the most optimal way
-        model_kwargs = dict(torch_dtype=torch_dtype)
+        model_kwargs = dict(
+            torch_dtype=torch_dtype,
+            attn_implementation="flash_attention_2",
+        )
 
         # Case when resuming run. For both pretraining and fine tuning
         if self.hparams.resume_run:
@@ -751,22 +744,29 @@ class Parameters(Serializable):
         else:
             logger.info("Using newly initialized model")
             # vl_config = config_class(**self.hparams.model_config)
-            vl_config = config_class.from_pretrained(
-                self.hparams.model_name,
-                revision=self.hparams.revision,
-                new_model=True,
+            text_model_name = self.hparams.model_config.pop("text_model_name")
+            vision_model_name = self.hparams.model_config.pop("vision_model_name")
+            vl_config = config_class.from_pretrained_models(
+                text_model_name = text_model_name,
+                vision_model_name = vision_model_name,
                 additional_vocab_size=len(eval(self.hparams.tokenizer_add_tokens)),
                 torch_dtype=torch_dtype,
                 **self.hparams.model_config,
             )
-            vl_model = model_class.from_pretrained_models(self.hparams.model_name, config=vl_config, **model_kwargs)
+            # TODO: Probably could be further improved
+            vl_model = model_class.from_pretrained_models(
+                text_model_name=text_model_name,
+                vision_model_name=vision_model_name,
+                vl_config=vl_config, 
+                **model_kwargs
+            )
+
+            vl_model.freeze_relevant_params(vl_config)
 
         return vl_model
 
-def get_config(print_config: bool = False):
+def get_config():
     parameters: Parameters = Parameters.parse()
-    if print_config:
-        print(parameters)
     return parameters
 
 

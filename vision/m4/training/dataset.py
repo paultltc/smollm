@@ -31,7 +31,6 @@ from m4.training.enums import DatasetNames, DatasetTypes, MaskingTypes
 from m4.training.collator import (
     SimpleDataCollatorForVisionLanguage, 
     DataCollatorForVisionLanguageModeling, 
-    DataCollatorForVisionLanguageSFT
 )
 
 
@@ -101,7 +100,6 @@ def simple_collate(x):
 
 collators_map = {
     MaskingTypes.MLM: DataCollatorForVisionLanguageModeling,
-    MaskingTypes.SFT: DataCollatorForVisionLanguageSFT,
 }
 
 split_fn_map = {
@@ -121,7 +119,7 @@ def get_mapper(
     max_seq_len: int = 256,
     max_num_images: int = 5,
     max_image_size: int = 384,
-    vision_encoder_max_image_size: int = 384,
+    vision_encoder_max_image_size: int = None,
     pre_split_scale_up_max=1.0,
     pre_split_scale_up_frequency=0.0,
     is_webdataset: bool = False,
@@ -484,9 +482,10 @@ def get_dataloader(
 
             # MAPPER
             dataset_config: DatasetParams = getattr(data_param, dataset_name.name.lower())
-            dataset_kwargs = asdict(dataset_config)
-            signature = inspect.signature(get_mapper)
-            dataset_kwargs = {k: v for k, v in dataset_kwargs.items() if k in signature.parameters}
+            dataset_kwargs = {
+                k: v for k, v in asdict(dataset_config).items() 
+                if k in inspect.signature(get_mapper).parameters
+            }
             mapper = get_mapper(
                 tokenizer=tokenizer,
                 image_transform=image_transforms[dataset_name.name.lower()],
@@ -497,7 +496,10 @@ def get_dataloader(
             # COLLATOR
             collator_class = collators_map.get(mask_type, SimpleDataCollatorForVisionLanguage)
             logger.info(f"Using collator: {collator_class.__name__}")
-            collator_kwargs = {k: v for k,v in collator_kwargs.items() if k in inspect.signature(collator_class).parameters}
+            collator_kwargs = {
+                k: v for k,v in collator_kwargs.items() 
+                if k in inspect.signature(collator_class).parameters
+            }
             collator = collator_class(
                 processor=mapper,
                 tokenizer=tokenizer, 

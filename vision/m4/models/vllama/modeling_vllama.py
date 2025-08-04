@@ -17,9 +17,10 @@ from m4.training.utils import (
     regex_lookup
 )
 
-from .configuration_vbert import VBertConfig
+from .configuration_vllama import VLlamaConfig
 
 from transformers import AutoModel, AutoConfig, AutoModelForMaskedLM
+from transformers.cache_utils import Cache, DynamicCache, StaticCache
 from transformers.modeling_utils import PreTrainedModel
 from transformers.modeling_outputs import BaseModelOutput
 from transformers.models.bert.modeling_bert import BaseModelOutputWithPoolingAndCrossAttentions, MaskedLMOutput
@@ -45,12 +46,14 @@ from m4.training.utils import (
 logger = logging.get_logger(__name__)
 
 @dataclass
-class VBertBaseModelOutput(BaseModelOutput):
+class VLlamaBaseModelOutputWithPast(BaseModelOutput):
     """
-    Base class for SmolVLM model's outputs that may also contain a past key/values (to speed up sequential decoding).
+    Base class for VLlama3 model's outputs that may also contain a past key/values (to speed up sequential decoding).
+
     Args:
         last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
             Sequence of hidden-states at the output of the last layer of the model.
+
             If `past_key_values` is used only the last hidden-state of the sequences of shape `(batch_size, 1,
             hidden_size)` is output.
         past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
@@ -58,59 +61,77 @@ class VBertBaseModelOutput(BaseModelOutput):
             `(batch_size, num_heads, sequence_length, embed_size_per_head)`) and optionally if
             `config.is_encoder_decoder=True` 2 additional tensors of shape `(batch_size, num_heads,
             encoder_sequence_length, embed_size_per_head)`.
+
             Contains pre-computed hidden-states (key and values in the self-attention blocks and optionally if
             `config.is_encoder_decoder=True` in the cross-attention blocks) that can be used (see `past_key_values`
             input) to speed up sequential decoding.
         hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
             Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
             one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
         attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
             Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
+
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
         image_hidden_states (`tuple(torch.FloatTensor)`, *optional*):
             Tuple of `torch.FloatTensor` (one for the output of the image embeddings, `(batch_size, num_images,
             sequence_length, hidden_size)`.
-            image_hidden_states of the model produced by the vision encoder
+
+            image_hidden_states of the model produced by the vision encoder, and optionally by the perceiver
     """
 
     last_hidden_state: torch.FloatTensor = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
-    attentions: Optional[Tuple[torch.FloatTensor]] = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
+    hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
+    attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
     image_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
 
 @dataclass
-class VBertMaskedLMOutput(MaskedLMOutput):
+class VLlamaCausalLMOutputWithPast(BaseModelOutput):
     """
-    Base class for SmolVLM model's outputs that may also contain a past key/values (to speed up sequential decoding).
+    Base class for VLlama3 causal language model (or autoregressive) outputs.
+
     Args:
-        loss (`torch.FloatTensor`, *optional*, returned when `labels` is provided):
-            Masked language modeling (MLM) loss.
-        logits (`torch.FloatTensor`): 
+        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
+            Language modeling loss (for next-token prediction).
+        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
             Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
+        past_key_values (`tuple(tuple(torch.FloatTensor))`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
+            Tuple of `tuple(torch.FloatTensor)` of length `config.n_layers`, with each tuple having 2 tensors of shape
+            `(batch_size, num_heads, sequence_length, embed_size_per_head)`)
+
+            Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
+            `past_key_values` input) to speed up sequential decoding.
         hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
             Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
             one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
+
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
         attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
             Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
             sequence_length)`.
+
             Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
             heads.
         image_hidden_states (`tuple(torch.FloatTensor)`, *optional*):
             Tuple of `torch.FloatTensor` (one for the output of the image embeddings, `(batch_size, num_images,
             sequence_length, hidden_size)`.
-            image_hidden_states of the model produced by the vision encoder
+
+            image_hidden_states of the model produced by the vision encoder, and optionally by the perceiver
     """
+
     loss: Optional[torch.FloatTensor] = None
     logits: torch.FloatTensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None
     hidden_states: Optional[Tuple[torch.FloatTensor, ...]] = None
     attentions: Optional[Tuple[torch.FloatTensor, ...]] = None
-    image_hidden_states: Optional[torch.FloatTensor] = None
+    image_hidden_states: Optional[Tuple[torch.FloatTensor]] = None
 
-class VBertSimpleMLP(nn.Module):
+
+class VLlamaSimpleMLP(nn.Module):
     def __init__(self, input_size, output_size):
         super().__init__()
         self.proj = nn.Linear(input_size, output_size, bias=False)
@@ -118,11 +139,11 @@ class VBertSimpleMLP(nn.Module):
     def forward(self, x):
         return self.proj(x)
 
-class VBertConnector(nn.Module):
+class VLlamaConnector(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.scale_factor = config.pixel_shuffle_factor
-        self.modality_projection = VBertSimpleMLP(
+        self.modality_projection = VLlamaSimpleMLP(
             input_size=config.vision_config.hidden_size * (config.scale_factor**2),
             output_size=config.text_config.hidden_size
         )
@@ -143,11 +164,11 @@ class VBertConnector(nn.Module):
         image_hidden_states = self.modality_projection(image_hidden_states)
         return image_hidden_states
 
-class VBertPreTrainedModel(VLOOMPreTrainedModelBase):
-    config_class = VBertConfig
+class VLlamaPreTrainedModel(VLOOMPreTrainedModelBase):
+    config_class = VLlamaConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
-    _no_split_modules = ["VBertDecoderLayer"]
+    _no_split_modules = ["VLlamaDecoderLayer"]
     _skip_keys_device_placement = "past_key_values"
     _supports_flash_attn_2 = True
     _supports_sdpa = True
@@ -174,18 +195,18 @@ class VBertPreTrainedModel(VLOOMPreTrainedModelBase):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
 
-class VBertModel(VBertPreTrainedModel):
+class VLlamaModel(VLlamaPreTrainedModel):
     """
     A subclass of Idefics3Model. We do *not* remove or block the call to inputs_merger
     in forward. Instead, we override inputs_merger here with custom logic.
     """
 
-    def __init__(self, config: VBertConfig, **kwargs):
+    def __init__(self, config: VLlamaConfig, **kwargs):
         super().__init__(config)
 
-        self.vision_model = VBertModel.init_vision_model(config, **kwargs)
-        self.connector = VBertConnector(config)
-        self.text_model = VBertModel.init_language_model(config, **kwargs)
+        self.vision_model = VLlamaModel.init_vision_model(config, **kwargs)
+        self.connector = VLlamaConnector(config)
+        self.text_model = VLlamaModel.init_language_model(config, **kwargs)
 
         self.image_seq_len = int(
             ((config.vision_config.image_size // config.vision_config.patch_size) ** 2) / (config.scale_factor**2)
@@ -195,7 +216,7 @@ class VBertModel(VBertPreTrainedModel):
         self.post_init()
 
     @staticmethod
-    def init_vision_model(config: VBertConfig, **kwargs):
+    def init_vision_model(config: VLlamaConfig, **kwargs):
         vision_model_config = AutoConfig.from_pretrained(
             config.vision_config.vision_model_name,
             trust_remote_code=True,
@@ -211,7 +232,7 @@ class VBertModel(VBertPreTrainedModel):
         return vision_model
 
     @staticmethod
-    def init_language_model(config: VBertConfig, **kwargs):
+    def init_language_model(config: VLlamaConfig, **kwargs):
         text_model_config = AutoConfig.from_pretrained(
             config.text_config.text_model_name,
             trust_remote_code=True,
@@ -311,7 +332,7 @@ class VBertModel(VBertPreTrainedModel):
 
         merged_embeds = torch.where(image_mask.unsqueeze(-1), image_embeds, inputs_embeds)
         return merged_embeds
-
+    
     def embed_tokens(self, input_ids: torch.LongTensor) -> torch.FloatTensor:
         """
         Override the embed_tokens method to use the text model's input embeddings.
@@ -321,7 +342,7 @@ class VBertModel(VBertPreTrainedModel):
             raise ValueError("The text model does not have input embeddings.")
         
         return self.text_model.get_input_embeddings()(input_ids).to(input_ids.device)
-    
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -337,39 +358,31 @@ class VBertModel(VBertPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPoolingAndCrossAttentions]:    
+    ) -> Union[Tuple, VLlamaBaseModelOutputWithPast]:    
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
 
         if self.training and self.text_model.gradient_checkpointing and use_cache:
             logger.warning_once(
-                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
             )
             use_cache = False
 
-        # retrieve input_ids and inputs_embeds
-        if input_ids is not None:
-            batch_size, seq_length = input_ids.shape
-        elif inputs_embeds is not None:
-            batch_size, seq_length, _ = inputs_embeds.shape
-        else:
-            raise ValueError("You have to specify either input_ids or inputs_embeds")
-
-        past_seen_tokens = 0
-        if use_cache:
-            if past_key_values is None:
-                past_key_values = DynamicCache()
-            past_seen_tokens = past_key_values.get_seq_length()
-
-        if inputs_embeds is not None and input_ids is None and past_seen_tokens == 0:
-            raise ValueError("When first calling the model, if input_embeds are passed, input_ids should not be None.")
-
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+
+        if inputs_embeds is not None and input_ids is None:
+            raise ValueError("When first calling the model, if input_embeds are passed, input_ids should not be None.")
 
         # START VISUAL INPUTS INTEGRATION
         if pixel_values is not None and image_hidden_states is not None:
@@ -436,22 +449,23 @@ class VBertModel(VBertPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            # past_key_values=past_key_values,
-            # use_cache=use_cache,
-            # cache_position=cache_position,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            cache_position=cache_position,
         )
 
         if not return_dict:
             return tuple(v for v in [*outputs, image_hidden_states] if v is not None)
 
-        return VBertBaseModelOutput(
+        return VLlamaBaseModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
+            past_key_values=past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             image_hidden_states=image_hidden_states,
         )
 
-class VBertForMaskedLM(VBertPreTrainedModel):
+class VLlamaForCausalLM(VLlamaPreTrainedModel):
     # _tied_weights_keys = ["predictions.decoder.bias", "cls.predictions.decoder.weight"]
 
     def __init__(self, config, **kwargs):
@@ -462,14 +476,8 @@ class VBertForMaskedLM(VBertPreTrainedModel):
         self.out_additional_features = config.additional_vocab_size
         self.vocab_size = config.vocab_size
 
-        if config.is_decoder:
-            logger.warning(
-                "If you want to use `BertForMaskedLM` make sure `config.is_decoder=False` for "
-                "bi-directional self-attention."
-            )
-
-        self.model = VBertModel(config, **kwargs)
-        self.lm_head = VBertForMaskedLM.init_lm_head(config, **kwargs)
+        self.model = VLlamaModel(config, **kwargs)
+        self.lm_head = VLlamaForCausalLM.init_lm_head(config, **kwargs)
         if self.out_additional_features > 0:
             self.additional_fc = nn.Linear(
                 in_features=self.in_features,
@@ -518,7 +526,8 @@ class VBertForMaskedLM(VBertPreTrainedModel):
             output_attentions: Optional[bool] = None,
             output_hidden_states: Optional[bool] = None,
             return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, VBertMaskedLMOutput]:
+            cache_position: Optional[torch.LongTensor] = None,
+    ) -> Union[Tuple, VLlamaCausalLMOutputWithPast]:
         r"""
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -534,7 +543,7 @@ class VBertForMaskedLM(VBertPreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
 
-        # Pass the inputs to VBertModel
+        # Pass the inputs to VLlamaModel
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -548,6 +557,7 @@ class VBertForMaskedLM(VBertPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            cache_position=cache_position,
         )
 
         # Pass the outputs to the MLM head
@@ -559,23 +569,140 @@ class VBertForMaskedLM(VBertPreTrainedModel):
             logits = torch.cat((logits, additional_features), -1)
         logits = logits.float()
 
-        masked_lm_loss = None
+        loss = None
         if labels is not None:
-            # print the ratio of not ignored tokens
+            # Shift so that tokens < n predict n
+            # if attention_mask is not None:
+            #     shift_attention_mask = attention_mask[..., 1:]
+            #     shift_logits = logits[..., :-1, :][shift_attention_mask != 0].contiguous()
+            #     shift_labels = labels[..., 1:][shift_attention_mask != 0].contiguous()
+            # else:
+            #     shift_logits = logits[..., :-1, :].contiguous()
+            #     shift_labels = labels[..., 1:].contiguous()
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
             loss_fct = CrossEntropyLoss()
-            masked_lm_loss = loss_fct(logits.view(-1, self.vocab_size + self.out_additional_features), labels.view(-1))
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         if not return_dict:
-            output = (logits,) + outputs[2:]
-            return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
 
-        return VBertMaskedLMOutput(
-            loss=masked_lm_loss,
+        return VLlamaCausalLMOutputWithPast(
+            loss=loss,
             logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             image_hidden_states=outputs.image_hidden_states,
         )
+
+    def prepare_inputs_for_generation(
+            self,
+            input_ids,
+            past_key_values=None,
+            attention_mask=None,
+            inputs_embeds=None,
+            cache_position=None,
+            position_ids=None,
+            use_cache=True,
+            **kwargs,
+    ):
+        past_length = 0
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                past_length = cache_position[0] if cache_position is not None else past_key_values.get_seq_length()
+                max_cache_length = (
+                    torch.tensor(past_key_values.get_max_length(), device=input_ids.device)
+                    if past_key_values.get_max_length() is not None
+                    else None
+                )
+                cache_length = past_length if max_cache_length is None else torch.min(max_cache_length, past_length)
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2]
+                max_cache_length = None
+
+            # Keep only the unprocessed tokens:
+            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
+            # some of the inputs are exclusively passed as part of the cache (e.g. when passing input_embeds as input)
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
+            # input_ids based on the past_length.
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+
+            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
+            if (
+                max_cache_length is not None
+                and attention_mask is not None
+                and cache_length + input_ids.shape[1] > max_cache_length
+            ):
+                attention_mask = attention_mask[:, -max_cache_length:]
+
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
+            # recompiles graphs as the stride of the inputs is a guard. Ref: https://github.com/huggingface/transformers/pull/29114
+            # TODO: use `next_tokens` directly instead.
+            model_inputs = {"input_ids": input_ids.contiguous()}
+
+        input_length = position_ids.shape[-1] if position_ids is not None else input_ids.shape[-1]
+        if cache_position is None:
+            cache_position = torch.arange(past_length, past_length + input_length, device=input_ids.device)
+        elif use_cache:
+            cache_position = cache_position[-input_length:]
+        image_hidden_states = kwargs.get("image_hidden_states", None)
+        if image_hidden_states is not None:
+            pixel_values = None
+            pixel_attention_mask = None
+        else:
+            pixel_values = kwargs.get("pixel_values", None)
+            pixel_attention_mask = kwargs.get("pixel_attention_mask", None)
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "cache_position": cache_position,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+                "attention_mask": attention_mask,
+                "pixel_values": pixel_values,
+                "pixel_attention_mask": pixel_attention_mask,
+                "image_hidden_states": image_hidden_states,
+            }
+        )
+        return model_inputs
+
+    def _update_model_kwargs_for_generation(self, outputs, model_kwargs, is_encoder_decoder, **kwargs):
+        model_kwargs = super()._update_model_kwargs_for_generation(
+            outputs=outputs,
+            model_kwargs=model_kwargs,
+            is_encoder_decoder=is_encoder_decoder,
+            **kwargs,
+        )
+        # Get the precomputed image_hidden_states
+        model_kwargs["image_hidden_states"] = outputs.image_hidden_states
+        return model_kwargs
+    
+    @staticmethod
+    # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM._reorder_cache
+    def _reorder_cache(past_key_values, beam_idx):
+        reordered_past = ()
+        for layer_past in past_key_values:
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
+            )
+        return reordered_past
 
     def get_model_tflops_per_batch_per_gpu(self, hparams, data_param, tokenizer, max_num_images, max_num_tokens=None):
         config_vl_model = self.config

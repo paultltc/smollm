@@ -1,0 +1,11 @@
+wandb
+accelerate
+deepspeed==0.15.4
+datasets
+transformers
+peft
+simple_parsing
+albumentations
+pynvml
+webdataset
+tensorboardX

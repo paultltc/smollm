@@ -34,8 +34,10 @@ from m4.utils.check_valid_tokenizer import check_valid_tokenizer
 IMAGE_TOKEN = "<image>"
 FAKE_TOKEN_AROUND_IMAGE_V2 = "<fake_token_around_image>"
 FAKE_TOKEN_AROUND_IMAGE_V1 = "\n\n"
+USER_TOKEN = "User:"
 ASSISTANT_TOKEN = "\nAssistant:"
 END_OF_UTTERANCE_TOKEN = "<end_of_utterance>"
+PATCH_POSITION_TOKEN = "<row_{row}_col_{col}>"
 # Originally taken from the values used in OpenCLIP
 IMAGE_DATASET_MEAN = (0.48145466, 0.4578275, 0.40821073)
 IMAGE_DATASET_STD = (0.26862954, 0.26130258, 0.27577711)
@@ -199,7 +201,7 @@ nougat_transform = alb_wrapper(
         [
             Bitmap(p=0.05),
             alb.OneOf([Erosion((2, 3)), Dilation((2, 3))], p=0.02),
-            alb.Affine(shear={"x": (0, 3), "y": (-3, 0)}, cval=(255, 255, 255), p=0.03),
+            alb.Affine(shear={"x": (0, 3), "y": (-3, 0)}, p=0.03),
             alb.ShiftScaleRotate(
                 shift_limit_x=(0, 0.04),
                 shift_limit_y=(0, 0.03),
@@ -207,26 +209,23 @@ nougat_transform = alb_wrapper(
                 rotate_limit=2,
                 border_mode=0,
                 interpolation=2,
-                value=(255, 255, 255),
                 p=0.03,
             ),
             alb.GridDistortion(
                 distort_limit=0.05,
                 border_mode=0,
                 interpolation=2,
-                value=(255, 255, 255),
                 p=0.04,
             ),
             alb.Compose(
                 [
-                    alb.Affine(translate_px=(0, 5), p=1.0, cval=(255, 255, 255)),
+                    alb.Affine(translate_px=(0, 5), p=1.0),
                     alb.ElasticTransform(
                         p=1,
                         alpha=50,
                         sigma=120 * 0.1,
-                        alpha_affine=120 * 0.01,
+                        # alpha_affine=120 * 0.01,
                         border_mode=0,
-                        value=(255, 255, 255),
                     ),
                 ],
                 p=0.04,
@@ -402,11 +401,12 @@ def build_image_transform(
 
     return transform
 
+LOW_RESOLUTION_THRESHOLD = 1024
 
 def image_splitting(
     image,
-    vision_encoder_max_image_size,
     max_image_size,
+    vision_encoder_max_image_size=None,
     pre_split_scale_up_max=1.0,
     pre_split_scale_up_frequency=0.0,
     scale_up_factor=None,
@@ -429,7 +429,7 @@ def image_splitting(
 
     elif (pre_split_scale_up_frequency is not None) and (np.random.random() < pre_split_scale_up_frequency):
         random_number = np.random.random()
-        if max_image_size <= 1092:
+        if max_image_size <= LOW_RESOLUTION_THRESHOLD:
             if random_number < 0.5:
                 num_sub_images_longest_side = 1
             elif random_number < 0.8:
@@ -458,17 +458,19 @@ def image_splitting(
     if width >= height:
         if width > max_image_size:
             width = max_image_size
-        else:
+        elif vision_encoder_max_image_size is not None:
             width = math.ceil(width / vision_encoder_max_image_size) * vision_encoder_max_image_size
         height = int(width / aspect_ratio)
-        height = math.ceil(height / vision_encoder_max_image_size) * vision_encoder_max_image_size
+        if vision_encoder_max_image_size is not None:
+            height = math.ceil(height / vision_encoder_max_image_size) * vision_encoder_max_image_size
     elif height > width:
         if height > max_image_size:
             height = max_image_size
-        else:
+        elif vision_encoder_max_image_size is not None:
             height = math.ceil(height / vision_encoder_max_image_size) * vision_encoder_max_image_size
         width = int(height * aspect_ratio)
-        width = math.ceil(width / vision_encoder_max_image_size) * vision_encoder_max_image_size
+        if vision_encoder_max_image_size is not None:
+            width = math.ceil(width / vision_encoder_max_image_size) * vision_encoder_max_image_size
 
     if (width == 0) or (height == 0):
         # For some reasons it can happen (rarely) during a training. Don't know the cause.
@@ -477,7 +479,7 @@ def image_splitting(
     image = image.resize((width, height), Image.LANCZOS)
 
     frames = []
-    if height > vision_encoder_max_image_size or width > vision_encoder_max_image_size:
+    if (vision_encoder_max_image_size is not None) and (height > vision_encoder_max_image_size or width > vision_encoder_max_image_size):
         # Calculate the number of splits
         num_splits_w = math.ceil(width / vision_encoder_max_image_size)
         num_splits_h = math.ceil(height / vision_encoder_max_image_size)
@@ -887,66 +889,97 @@ def deepspeed_gathered_parameters_context_manager(params, modify=True):
 
 # adapted from https://github.com/huggingface/transformers/blob/a081f292ca8479eaf66d7396186021268f128829/src/transformers/modeling_utils.py#L438-L496
 # as it appears to be a private function
-def load_state_dict_into_model(model_to_load, state_dict, start_prefix):
-    # Convert old format to new format if needed from a PyTorch state_dict
-    old_keys = []
-    new_keys = []
-    for key in state_dict.keys():
-        new_key = None
-        if "gamma" in key:
-            new_key = key.replace("gamma", "weight")
-        if "beta" in key:
-            new_key = key.replace("beta", "bias")
-        if new_key:
-            old_keys.append(key)
-            new_keys.append(new_key)
-    for old_key, new_key in zip(old_keys, new_keys):
-        state_dict[new_key] = state_dict.pop(old_key)
+# def load_state_dict_into_model(model_to_load, state_dict, start_prefix):
+#     # Convert old format to new format if needed from a PyTorch state_dict
+#     old_keys = []
+#     new_keys = []
+#     for key in state_dict.keys():
+#         new_key = None
+#         if "gamma" in key:
+#             new_key = key.replace("gamma", "weight")
+#         if "beta" in key:
+#             new_key = key.replace("beta", "bias")
+#         if new_key:
+#             old_keys.append(key)
+#             new_keys.append(new_key)
+#     for old_key, new_key in zip(old_keys, new_keys):
+#         state_dict[new_key] = state_dict.pop(old_key)
 
-    # copy state_dict so _load_from_state_dict can modify it
-    metadata = getattr(state_dict, "_metadata", None)
-    state_dict = state_dict.copy()
-    if metadata is not None:
-        state_dict._metadata = metadata
+#     # copy state_dict so _load_from_state_dict can modify it
+#     metadata = getattr(state_dict, "_metadata", None)
+#     state_dict = state_dict.copy()
+#     if metadata is not None:
+#         state_dict._metadata = metadata
 
-    error_msgs = []
+#     error_msgs = []
 
-    # PyTorch's `_load_from_state_dict` does not copy parameters in a module's descendants
-    # so we need to apply the function recursively.
-    def load(module: torch.nn.Module, state_dict, prefix=""):
-        local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
-        args = (state_dict, prefix, local_metadata, True, [], [], error_msgs)
-        # Parameters of module and children will start with prefix. We can exit early if there are none in this
-        # state_dict
-        if len([key for key in state_dict if key.startswith(prefix)]) > 0:
-            if is_deepspeed_zero_init_enabled():
-                import deepspeed
+#     # PyTorch's `_load_from_state_dict` does not copy parameters in a module's descendants
+#     # so we need to apply the function recursively.
+#     def load(module: torch.nn.Module, state_dict, prefix=""):
+#         local_metadata = {} if metadata is None else metadata.get(prefix[:-1], {})
+#         args = (state_dict, prefix, local_metadata, True, [], [], error_msgs)
+#         # Parameters of module and children will start with prefix. We can exit early if there are none in this
+#         # state_dict
+#         if len([key for key in state_dict if key.startswith(prefix)]) > 0:
+#             if is_deepspeed_zero_init_enabled():
+#                 import deepspeed
 
-                # In sharded models, each shard has only part of the full state_dict, so only gather
-                # parameters that are in the current state_dict.
-                named_parameters = dict(module.named_parameters(prefix=prefix[:-1], recurse=False))
-                params_to_gather = [named_parameters[k] for k in state_dict.keys() if k in named_parameters]
-                if len(params_to_gather) > 0:
-                    # because zero3 puts placeholders in model params, this context
-                    # manager gathers (unpartitions) the params of the current layer, then loads from
-                    # the state dict and then re-partitions them again
-                    with deepspeed.zero.GatheredParameters(params_to_gather, modifier_rank=0):
-                        if torch.distributed.get_rank() == 0:
-                            module._load_from_state_dict(*args)
-            else:
-                module._load_from_state_dict(*args)
+#                 # In sharded models, each shard has only part of the full state_dict, so only gather
+#                 # parameters that are in the current state_dict.
+#                 named_parameters = dict(module.named_parameters(prefix=prefix[:-1], recurse=False))
+#                 params_to_gather = [named_parameters[k] for k in state_dict.keys() if k in named_parameters]
+#                 if len(params_to_gather) > 0:
+#                     # because zero3 puts placeholders in model params, this context
+#                     # manager gathers (unpartitions) the params of the current layer, then loads from
+#                     # the state dict and then re-partitions them again
+#                     with deepspeed.zero.GatheredParameters(params_to_gather, modifier_rank=0):
+#                         if torch.distributed.get_rank() == 0:
+#                             module._load_from_state_dict(*args)
+#             else:
+#                 module._load_from_state_dict(*args)
 
-        for name, child in module._modules.items():
-            if child is not None:
-                load(child, state_dict, prefix + name + ".")
+#         for name, child in module._modules.items():
+#             if child is not None:
+#                 load(child, state_dict, prefix + name + ".")
 
-    load(model_to_load, state_dict, prefix=start_prefix)
+#     # load(model_to_load, state_dict, prefix=start_prefix)
+#     missing, unexpected = model_to_load.load_state_dict(state_dict, strict=False)
+
+#     if missing:
+#         logger.warning("Missing keys:")
+#         for k in missing:
+#             logger.warning(f"  {k}")
+#     if unexpected:
+#         logger.warning("Unexpected keys:")
+#         for k in unexpected:
+#             logger.warning(f"  {k}")
+
+#     # Delete `state_dict` so it could be collected by GC earlier. Note that `state_dict` is a copy of the argument, so
+#     # it's safe to delete it.
+#     del state_dict
+
+#     return error_msgs
+
+def load_state_dict_into_model(model_to_load, state_dict, start_prefix=""):
+    # keep only the keys that start with `start_prefix` if not empty
+    if len(start_prefix) > 0:
+        state_dict = {k.split(start_prefix, maxsplit=1): v for k, v in state_dict.items() if k.startswith(start_prefix)}
+
+    # load(model_to_load, state_dict, prefix=start_prefix)
+    missing, unexpected = model_to_load.load_state_dict(state_dict, strict=False)
+
+    if missing:
+        logger.warning("Missing keys:")
+        for k in missing:
+            logger.warning(f"  {k}")
+    if unexpected:
+        logger.warning("Unexpected keys:")
+        for k in unexpected:
+            logger.warning(f"  {k}")
+
     # Delete `state_dict` so it could be collected by GC earlier. Note that `state_dict` is a copy of the argument, so
     # it's safe to delete it.
     del state_dict
-
-    return error_msgs
-
 
 def get_stats(var, ctx):
     if var is None:

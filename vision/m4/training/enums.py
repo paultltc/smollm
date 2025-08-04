@@ -25,4 +25,4 @@ class DatasetTypes(Enum):
 
 class MaskingTypes(Enum):
     MLM = "mlm"
-    SFT = "sft"
+    CLM = "clm"
