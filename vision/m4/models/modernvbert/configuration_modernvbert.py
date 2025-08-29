@@ -42,7 +42,7 @@ class ModernVBertTextConfig(PretrainedConfig):
 
     def __init__(
         self,
-        text_model_name="answerdotai/ModernBERT-base",
+        text_model_name="jhu-clsp/ettin-encoder-150m",
         **kwargs,
     ):
         self.text_model_name = text_model_name
@@ -139,7 +139,7 @@ class ModernVBertConfig(PretrainedConfig):
     is_composition = True
     # sub_configs = {"text_config": ModernVBertTextConfig, "vision_config": ModernVBertVisionConfig}
 
-    DEFAULT_TEXT_MODEL_NAME = "answerdotai/ModernBERT-base"
+    DEFAULT_TEXT_MODEL_NAME = "jhu-clsp/ettin-encoder-150m"
     DEFAULT_VISION_MODEL_NAME = "google/siglip2-base-patch16-512"
 
     def __init__(

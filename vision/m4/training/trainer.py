@@ -226,9 +226,9 @@ Batch sizes:
     - Optimizer batch size: {self.optim_param.opt_batch_size}
 -------------------------------------
     """)
-        logger.info("Trainable/non-trainable parameters:")
-        for name, param in vl_model.named_parameters():
-            logger.info(f"    Name: {name} | Trainable: {param.requires_grad}")
+        # logger.info("Trainable/non-trainable parameters:")
+        # for name, param in vl_model.named_parameters():
+        #     logger.info(f"    Name: {name} | Trainable: {param.requires_grad}")
 
         if len(self.hparams.train_logging_grad_param_deepspeed) > 0:
             from deepspeed.utils import safe_get_full_fp32_param, safe_get_full_grad, safe_get_full_optimizer_state

@@ -54,16 +54,15 @@ def set_logging_levels(log_level):
         from deepspeed.utils import logger as ds_logger
         ds_logger.setLevel(log_level)
 
-def _init_accelerator(grad_acc_steps, timeout_seconds=60):
+def _init_accelerator(grad_acc_steps, timeout_seconds=600):
     """
     Initialize the accelerator with the appropriate settings.
     """
-    kwargs_handlers = [InitProcessGroupKwargs(timeout=timedelta(seconds=timeout_seconds))]
     return Accelerator(
         log_with="all",
         rng_types=["torch", "cuda", "generator"],
         gradient_accumulation_steps=grad_acc_steps,
-        kwargs_handlers=kwargs_handlers,
+        kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(seconds=timeout_seconds))],
     )
 
 if __name__ == "__main__":
@@ -84,10 +83,7 @@ if __name__ == "__main__":
         raise NotImplementedError("Instant resume functionality not yet supported for non-iterable datasets!")
 
     # Initialize accelerator
-    accelerator = _init_accelerator(
-        grad_acc_steps=config.hparams.grad_acc_size,
-        timeout_seconds=60
-    )
+    accelerator = _init_accelerator(grad_acc_steps=config.hparams.grad_acc_size)
 
     if config.hparams.timing_break_down:
         accelerator.wait_for_everyone()
@@ -109,8 +105,9 @@ if __name__ == "__main__":
     # logger.info(f"** The job is running with the following arguments: **\n{config}\n **** ")
 
     # Load model
-    vl_model = config.load_model(torch_dtype=accelerate_torch_dtype())
-    vl_model = vl_model.to(accelerate_torch_dtype())
+    torch_dtype = accelerate_torch_dtype()
+    vl_model = config.load_model(torch_dtype=torch_dtype)
+    vl_model = vl_model.to(torch_dtype)
 
     # If we want to use_lora and are starting a pretraining, or if we want to use a new lora for fine tuning, create the config and add the adapter.
     if (
@@ -128,6 +125,7 @@ if __name__ == "__main__":
                 # Take off the suffixes ".weight" or ".bias"
                 target_module_name = ".".join(name.split(".")[:-1])
                 target_modules.append(target_module_name)
+
         peft_config = LoraConfig(
             target_modules=target_modules,
             **config.hparams.lora_config,
@@ -255,6 +253,10 @@ if __name__ == "__main__":
         val_loader=val_loader,
         config=config,
     )
+
+    # if we need to convert causal to bidir
+    for layer in vl_model.model.text_model.layers:
+            layer.self_attn.is_causal = False
 
     if config.hparams.timing_break_down:
         accelerator.wait_for_everyone()

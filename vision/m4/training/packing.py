@@ -398,6 +398,7 @@ def prepare_batch(
         "num_images": output_num_images[sort_by_padding],
         "num_text_tokens": output_num_text_tokens[sort_by_padding],
     }
+
     if padded_image_tensor is not None:
         result["pixel_values"] = padded_image_tensor[sort_by_padding]
     if padded_pixel_attention_masks is not None:
